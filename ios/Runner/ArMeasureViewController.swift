@@ -3189,7 +3189,8 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     tabs.layoutMargins = UIEdgeInsets(top: 3, left: 3, bottom: 3, right: 3)
     tabs.translatesAutoresizingMaskIntoConstraints = false
     let tabFont = PlanoraFont.inter(13, .semibold)
-    for md in Mode.allCases {
+    // Surface measuring is hidden from the camera.
+    for md in Mode.allCases where md != .surface {
       let b = UIButton(type: .custom)
       b.setTitle(md.label, for: .normal)
       b.titleLabel?.font = tabFont

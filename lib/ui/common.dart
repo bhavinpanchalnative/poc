@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../engine/units.dart';
@@ -34,7 +35,10 @@ Future<String?> askText(
 }
 
 /// A text field for a length in [unit] that validates as you type.
-class LengthField extends StatelessWidget {
+///
+/// On iOS the number keyboard has no Done or Return key, so while the field
+/// is focused a bar with a Done button sits on top of the keyboard.
+class LengthField extends StatefulWidget {
   const LengthField({
     super.key,
     required this.controller,
@@ -68,24 +72,105 @@ class LengthField extends StatelessWidget {
   }
 
   @override
+  State<LengthField> createState() => _LengthFieldState();
+}
+
+class _LengthFieldState extends State<LengthField> {
+  final _focus = FocusNode();
+  OverlayEntry? _doneBar;
+
+  @override
+  void initState() {
+    super.initState();
+    _focus.addListener(_onFocusChange);
+  }
+
+  void _onFocusChange() {
+    if (defaultTargetPlatform != TargetPlatform.iOS) return;
+    if (_focus.hasFocus) {
+      _showDoneBar();
+    } else {
+      _hideDoneBar();
+    }
+  }
+
+  void _showDoneBar() {
+    if (_doneBar != null) return;
+    _doneBar = OverlayEntry(
+        builder: (_) => _KeyboardDoneBar(onDone: _focus.unfocus));
+    Overlay.of(context, rootOverlay: true).insert(_doneBar!);
+  }
+
+  void _hideDoneBar() {
+    _doneBar?.remove();
+    _doneBar = null;
+  }
+
+  @override
+  void dispose() {
+    _focus.removeListener(_onFocusChange);
+    _hideDoneBar();
+    _focus.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final unit = widget.unit;
     return TextFormField(
-      controller: controller,
-      autofocus: autofocus,
+      controller: widget.controller,
+      focusNode: _focus,
+      autofocus: widget.autofocus,
       autovalidateMode: AutovalidateMode.onUserInteraction,
       keyboardType: unit == LengthUnit.feetInches
           ? TextInputType.text
           : const TextInputType.numberWithOptions(decimal: true),
+      textInputAction: TextInputAction.done,
       decoration: InputDecoration(
-        labelText: label,
+        labelText: widget.label,
         hintText: unit.inputHint,
-        helperText: helper,
+        helperText: widget.helper,
         helperMaxLines: 3,
         suffixText: unit == LengthUnit.feetInches ? null : unit.label,
       ),
-      validator: (v) =>
-          validate(v ?? '', unit, optional: optional, allowZero: allowZero),
-      onChanged: onChanged,
+      validator: (v) => LengthField.validate(v ?? '', unit,
+          optional: widget.optional, allowZero: widget.allowZero),
+      onChanged: widget.onChanged,
+    );
+  }
+}
+
+/// A Done bar on top of the iOS keyboard; hidden while no keyboard shows.
+class _KeyboardDoneBar extends StatelessWidget {
+  const _KeyboardDoneBar({required this.onDone});
+
+  final VoidCallback onDone;
+
+  @override
+  Widget build(BuildContext context) {
+    final keyboard = MediaQuery.viewInsetsOf(context).bottom;
+    if (keyboard == 0) return const SizedBox.shrink();
+    final cs = Theme.of(context).colorScheme;
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: keyboard,
+      child: Material(
+        color: cs.surfaceContainerHigh,
+        shape: Border(top: BorderSide(color: cs.outlineVariant)),
+        child: SizedBox(
+          height: 44,
+          child: Row(children: [
+            const Spacer(),
+            TextButton(
+              onPressed: onDone,
+              child: const Text('Done',
+                  style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
+            ),
+            const SizedBox(width: 8),
+          ]),
+        ),
+      ),
     );
   }
 }

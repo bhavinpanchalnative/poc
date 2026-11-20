@@ -3454,6 +3454,8 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             }
         }
         for (md in Mode.values()) {
+            // Surface measuring is hidden from the camera.
+            if (md == Mode.SURFACE) continue
             val tv = TextView(this).apply {
                 text = md.label
                 typeface = fontSemiBold

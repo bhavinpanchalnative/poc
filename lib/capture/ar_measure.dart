@@ -146,7 +146,8 @@ List<MeasuredLine> parseLines(List<double> raw,
         lineFromPoints(
           Vec3(raw[i], raw[i + 1], raw[i + 2]),
           Vec3(raw[i + 3], raw[i + 4], raw[i + 5]),
-          name: 'Line ${first + i ~/ 6}',
+          // No automatic name: the user names it.
+          name: '',
           at: at,
           estimated: i ~/ 6 < estimated.length && estimated[i ~/ 6] != 0,
         ),
@@ -162,7 +163,7 @@ List<MeasuredSurface> parseSurfaces(List<double> raw, double? floorY) => [
           Vec3(raw[i], raw[i + 1], raw[i + 2]),
           Vec3(raw[i + 3], raw[i + 4], raw[i + 5]),
           Vec3(raw[i + 6], raw[i + 7], raw[i + 8]),
-          name: 'Surface ${i ~/ 9 + 1}',
+          name: '',
           floorY: floorY,
         ),
     ];
@@ -205,12 +206,12 @@ class CapturedScan {
 /// Doors and windows measured when no room outline was found, kept on their
 /// own with their measured size.
 List<SavedOpening> looseOpeningsFrom(List<MarkedOpening> marked, DateTime at) {
-  final count = <OpeningType, int>{};
   return [
     for (final (k, o) in marked.indexed)
       SavedOpening(
         id: '${at.microsecondsSinceEpoch}_$k',
-        name: '${o.type.label} ${count[o.type] = (count[o.type] ?? 0) + 1}',
+        // No automatic name (such as Door 1): the user names it.
+        name: '',
         type: o.type,
         width: o.a.distanceTo(o.b),
         height: o.height,

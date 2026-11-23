@@ -48,6 +48,13 @@ class _DistancesScreenState extends State<DistancesScreen> {
       return;
     }
     if (got == null || got.isEmpty || !mounted) return;
+    // The user names each line measured (mandatory).
+    final unit = AppSettings.unit.value;
+    final names = await askNames(context,
+        title: got.length == 1 ? 'Name this line' : 'Name your lines',
+        labels: [for (final l in got) 'Line · ${formatLength(l.length, unit)}']);
+    if (!mounted) return;
+    got = [for (var i = 0; i < got.length; i++) got[i].copyWith(name: names[i])];
     setState(() => lines = [...got!.reversed, ...lines]);
     await LineStore.save(lines);
   }

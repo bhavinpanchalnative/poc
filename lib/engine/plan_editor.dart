@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'floor_plan_builder.dart';
 import 'geometry.dart';
 import 'models.dart';
@@ -65,6 +67,33 @@ class PlanEditor {
       for (var k = 0; k < plan.wallCount; k++)
         moving.contains(k) ? plan.corners[k] + shift : plan.corners[k],
     ], plan);
+  }
+
+  /// [line] with its end [end] (0 or 1) moved to [to] (plan coordinates):
+  /// the length follows the new distance on the floor plan, keeping the
+  /// height difference the line was measured with (its rise, or what its
+  /// length had beyond its footprint).
+  static MeasuredLine movedLineEnd(MeasuredLine line, int end, Vec2 to) {
+    if (line.footprint.length < 2) return line;
+    final fp = List.of(line.footprint)..[end] = to;
+    final oldRun = line.footprint[0].distanceTo(line.footprint[1]);
+    final rise = line.rise ??
+        math.sqrt(math.max(0.0, line.length * line.length - oldRun * oldRun));
+    final run = fp[0].distanceTo(fp[1]);
+    return line.copyWith(
+      footprint: fp,
+      run: run,
+      rise: rise,
+      length: math.sqrt(run * run + rise * rise),
+    );
+  }
+
+  /// Moves end [end] of line [k] to [to] (plan coordinates, metres).
+  static void moveLineEnd(
+      RoomScan scan, FloorPlan plan, int k, int end, Vec2 to) {
+    // The scan in plan coordinates first, so the line's ends are too.
+    applyCorners(scan, List.of(plan.corners), plan);
+    scan.lines[k] = movedLineEnd(plan.lines[k], end, to);
   }
 
   /// Moves corner [i] to [to] (plan coordinates, metres).

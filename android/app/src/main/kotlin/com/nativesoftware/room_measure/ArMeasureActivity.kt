@@ -298,6 +298,9 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
     private var lastOpeningAttempt = 0L
     private var lastWallSource: String? = null
 
+    /** When the floor-line wall correction was last logged (opening thread). */
+    @Volatile private var lastFloorLineDiagAt = 0L
+
     @Volatile
     private var detecting = false
 
@@ -405,6 +408,28 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
      *  estimated wall can drop out for a frame, and a tap a moment after the
      *  frame turned green must still add it. */
     private var lastStable: OpeningConsensus.State? = null
+
+    /**
+     * The door / window found, adjusted by hand on the camera view: its
+     * edges in [frame]'s wall coordinates (u along the wall, heights). Once
+     * the user drags one of its circles or lines it no longer follows new
+     * detections; ✓ adds it as adjusted, Undo goes back to automatic.
+     */
+    private class AdjustedOpening(
+        val frame: WallFrame, var left: Float, var right: Float, var bottom: Float, var top: Float,
+        val estimated: Boolean,
+    ) {
+        fun candidate() = OpeningCandidate(
+            left, right, bottom, top, frame.world(left, bottom), frame.world(right, bottom), top,
+            right - left, top - bottom, frame.floorY?.let { bottom - it }, 0f, estimated,
+        )
+    }
+
+    private var adjusted: AdjustedOpening? = null
+
+    /** What the finger holds: corners 0-3 (bottom-left, bottom-right,
+     *  top-right, top-left), edges 4-7 (bottom, right, top, left); -1 none. */
+    private var adjustGrab = -1
     private var lastStableAt = 0L
     /** The latest attempt with a wall (its image is saved with diagnostics). */
     private var lastOpeningResult: OpeningResult? = null
@@ -1083,9 +1108,26 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         try {
             openingExecutor.execute {
                 try {
-                    val img = OpeningDetector.rectify(wall.frame, cam, lum)
-                    val det = OpeningDetector.analyze(kind, wall.frame, img)
-                    runOnUiThread { onOpeningResult(OpeningResult(kind, gen, wall, img, det)) }
+                    // The wall is then placed by where it meets the floor
+                    // when that line is in view (see OpeningDetector.measure):
+                    // a detected wall a few cm out, or a guessed one, made the
+                    // door / window that much too small or too large.
+                    val res = OpeningDetector.measure(kind, wall.frame, cam, lum)
+                    val fl = res.floorLine
+                    if (fl != null && System.currentTimeMillis() - lastFloorLineDiagAt > 2000L) {
+                        lastFloorLineDiagAt = System.currentTimeMillis()
+                        diag(String.format("opening wall %s corrected by the floor line: %+.1f cm, %.1f°, %d strips",
+                            wall.source, fl.moved * 100, fl.turned, fl.strips))
+                    }
+                    val used = if (fl != null) OpeningWall(res.frame, wall.source + "+floor line") else wall
+                    // A window's wall taken through the floor at the bottom of
+                    // the screen is only a guess, of no use unless the floor
+                    // line confirmed where the wall is.
+                    if (fl == null && wall.source == "floor" && kind == OpeningKind.WINDOW) {
+                        runOnUiThread { onOpeningResult(OpeningResult(kind, gen, null, null, null)) }
+                    } else {
+                        runOnUiThread { onOpeningResult(OpeningResult(kind, gen, used, res.image, res.detection)) }
+                    }
                 } catch (e: Exception) {
                     Log.w(TAG, "opening detection failed", e)
                 } finally {
@@ -1271,7 +1313,8 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             val p = o + ray.dir * s
             make(p.x, p.z, nx, nz, "cloud", true)?.let { return it }
         }
-        if (kind == OpeningKind.DOOR && floorY != null) {
+        // (Windows too: the floor line then places the wall; see startOpeningAttempt.)
+        if (floorY != null) {
             val r = screenRay(viewProj, 0f, -1f)
             if (r != null && r.dir.y < -0.05f) {
                 val t = (floorY - r.origin.y) / r.dir.y
@@ -2087,9 +2130,109 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         autoOpeningKind = kind
     }
 
+    /** The frame drawn on the camera view: the hand-adjusted one, else the
+     *  detection while it is fresh; with the wall it lies on. */
+    private fun shownOpening(): Pair<OpeningCandidate, WallFrame>? {
+        adjusted?.let { return it.candidate() to it.frame }
+        val st = consensus.state ?: return null
+        if (!autoFresh()) return null
+        return st.candidate to st.frame
+    }
+
+    /** World point to pixels of a [w] x [h] view, or null behind the camera. */
+    private fun viewPoint(vp: FloatArray, p: Vec3, w: Int, h: Int): FloatArray? {
+        val v = FloatArray(4)
+        Matrix.multiplyMV(v, 0, vp, 0, floatArrayOf(p.x, p.y, p.z, 1f), 0)
+        if (v[3] <= NEAR_W) return null
+        return floatArrayOf((v[0] / v[3] + 1f) / 2f * w, (1f - v[1] / v[3]) / 2f * h)
+    }
+
+    /**
+     * A finger down at ([x], [y]) on the [w] x [h] camera view: grabs a
+     * corner circle of the door / window frame shown (or, away from them,
+     * one of its lines). The frame then stays as the user leaves it.
+     */
+    private fun grabOpening(x: Float, y: Float, w: Int, h: Int): Boolean {
+        if (!autoOpening()) return false
+        val snap = snapshot ?: return false
+        val (c, frame) = shownOpening() ?: return false
+        val corners = listOf(c.a, c.b, c.b.withY(c.topY), c.a.withY(c.topY))
+        val s = corners.map { viewPoint(snap.viewProj, it, w, h) }
+        var best = -1
+        var bestD = dp(32f)
+        for ((i, p) in s.withIndex()) {
+            if (p == null) continue
+            val d = kotlin.math.hypot(p[0] - x, p[1] - y)
+            if (d < bestD) {
+                bestD = d
+                best = i
+            }
+        }
+        if (best < 0) {
+            // A line: corner i to i + 1 is the bottom, right, top, left edge.
+            bestD = dp(24f)
+            for (i in 0 until 4) {
+                val p = s[i] ?: continue
+                val q = s[(i + 1) % 4] ?: continue
+                val dx = q[0] - p[0]
+                val dy = q[1] - p[1]
+                val len2 = dx * dx + dy * dy
+                val t = if (len2 > 0f) (((x - p[0]) * dx + (y - p[1]) * dy) / len2).coerceIn(0f, 1f) else 0f
+                val d = kotlin.math.hypot(p[0] + dx * t - x, p[1] + dy * t - y)
+                if (d < bestD) {
+                    bestD = d
+                    best = 4 + i
+                }
+            }
+        }
+        if (best < 0) return false
+        if (adjusted == null) {
+            adjusted = AdjustedOpening(frame, c.left, c.right, c.bottom, c.top, c.estimated)
+            diag("opening auto: adjusting by hand")
+        }
+        adjustGrab = best
+        return true
+    }
+
+    /** The grabbed circle or line follows the finger at ([x], [y]), on the
+     *  wall the frame lies on. */
+    private fun dragOpening(x: Float, y: Float, w: Int, h: Int) {
+        val adj = adjusted ?: return
+        val g = adjustGrab
+        if (g < 0 || w <= 0 || h <= 0) return
+        val snap = snapshot ?: return
+        val ray = screenRay(snap.viewProj, 2f * x / w - 1f, 1f - 2f * y / h) ?: return
+        val f = adj.frame
+        val n = f.normal
+        val den = ray.dir.x * n.x + ray.dir.z * n.z
+        if (abs(den) < 0.05f) return
+        val t = ((f.origin.x - ray.origin.x) * n.x + (f.origin.z - ray.origin.z) * n.z) / den
+        if (t <= 0.1f || t > 15f) return
+        val p = ray.origin + ray.dir * t
+        val u = f.uOf(p)
+        val v = p.y
+        val gap = 0.10f // smallest width / height
+        fun left() { adj.left = kotlin.math.min(u, adj.right - gap) }
+        fun right() { adj.right = max(u, adj.left + gap) }
+        fun bottom() { adj.bottom = kotlin.math.min(v, adj.top - gap) }
+        fun top() { adj.top = max(v, adj.bottom + gap) }
+        when (g) {
+            0 -> { left(); bottom() }
+            1 -> { right(); bottom() }
+            2 -> { right(); top() }
+            3 -> { left(); top() }
+            4 -> bottom()
+            5 -> right()
+            6 -> top()
+            7 -> left()
+        }
+    }
+
     private fun resetAutoSearch() {
         consensus.clear()
         lastStable = null
+        adjusted = null
+        adjustGrab = -1
         autoNoWall = false
         lastOpeningResult = null
         autoSearchSince = SystemClock.uptimeMillis()
@@ -2150,7 +2293,10 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         val cur = consensus.state
         val held = lastStable
         var settled = true
+        val adj = adjusted
         val st = when {
+            // Adjusted by hand: exactly as the user left it.
+            adj != null -> OpeningConsensus.State(adj.candidate(), adj.frame, true, 0, 0)
             cur != null && autoStable() -> cur
             held != null && now - lastStableAt <= STABLE_GRACE_MS -> held
             cur != null && now - lastAutoCandidateAt <= STABLE_GRACE_MS -> {
@@ -2177,7 +2323,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         val size = (if (est) "≈ " else "") + sizeText(c.width, c.height)
         diag(
             "${openingName()} ${openings.size} (auto, ${lastOpeningResult?.wall?.source}" +
-                "${if (est) ", estimated" else ""}${if (settled) "" else ", not settled"}): $size" +
+                "${if (est) ", estimated" else ""}${if (settled) "" else ", not settled"}${if (adj != null) ", adjusted by hand" else ""}): $size" +
                 (c.sill?.let { " sill ${m(it)}" } ?: "") + String.format(", strength %.1f", c.strength),
         )
         lastOpeningResult?.let { saveOpeningDiag(it, true) }
@@ -2263,13 +2409,14 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         val name = openingName()
         val now = SystemClock.uptimeMillis()
         return when {
+            adjusted != null -> "Drag the circles or lines onto the $name's frame, then tap ✓. Undo goes back to automatic."
             autoNoWall -> "Point at the wall around the $name so it can be found."
             autoStable() -> "${mode.label} found. Tap ✓ to add it."
             autoFresh(now) -> "Hold still…"
             now - max(lastAutoCandidateAt, autoSearchSince) >= AUTO_GIVE_UP_MS ->
                 "Can't find the frame edges. Step back so the whole frame is in view."
             mode == Mode.DOOR -> "Point at the middle of the door. Keep the whole frame and the floor below it in view."
-            else -> "Point at the middle of the window. Keep the whole window frame in view."
+            else -> "Point at the middle of the window. Keep the whole window frame, and the bottom of the wall below it if you can, in view."
         }
     }
 
@@ -2579,6 +2726,15 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
 
     private fun onUndo() {
         cancelAutoComplete("undo")
+        if (adjusted != null) {
+            // First undo drops the hand adjustment: the frame follows the
+            // detections again.
+            adjusted = null
+            adjustGrab = -1
+            flash("Back to automatic")
+            overlay.invalidate()
+            return
+        }
         when (history.removeLastOrNull()) {
             H_CORNER -> corners.removeAt(corners.lastIndex)
             H_EDGE -> pendingEdge = null
@@ -3033,7 +3189,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         setIfChanged(markGlyph, if (autoOpening()) "✓" else "+")
         // Door / Window: the disc turns teal (white ✓) while a found frame is
         // steady and ready to add.
-        val markReady = autoOpening() && autoStable()
+        val markReady = autoOpening() && (autoStable() || adjusted != null)
         if (markReadyShown != markReady) {
             markReadyShown = markReady
             markDisc.background = circle(if (markReady) SNAP else Color.WHITE)
@@ -3049,7 +3205,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                 tv.setTextColor(if (on) INK else TAB_IDLE)
             }
         }
-        setEnabled(undoButton, history.isNotEmpty())
+        setEnabled(undoButton, history.isNotEmpty() || adjusted != null)
         val canFinish =
             // A measured line, door or window can be finished with on its
             // own, without a room outline.
@@ -3715,8 +3871,40 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             it.visibility == VISIBLE && x >= it.left && x <= it.right && y >= it.top && y <= it.bottom
         }
 
+        /** The finger dragging the door / window frame's circle or line. */
+        private var adjustPointer = -1
+
+        /** Door / Window: the orange frame found can be dragged into place,
+         *  by its corner circles or its lines. Returns whether it took [e]. */
+        private fun adjustTouch(e: MotionEvent): Boolean {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (onPanel(e.x, e.y) || !grabOpening(e.x, e.y, width, height)) return false
+                    adjustPointer = e.getPointerId(0)
+                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val i = e.findPointerIndex(adjustPointer)
+                    if (i < 0) return adjustPointer >= 0
+                    dragOpening(e.getX(i), e.getY(i), width, height)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (adjustPointer < 0) return false
+                    if (e.actionMasked == MotionEvent.ACTION_POINTER_UP &&
+                        e.getPointerId(e.actionIndex) != adjustPointer
+                    ) return true
+                    adjustPointer = -1
+                    adjustGrab = -1
+                }
+                else -> return adjustPointer >= 0
+            }
+            invalidate()
+            return true
+        }
+
         @SuppressLint("ClickableViewAccessibility")
         override fun onTouchEvent(e: MotionEvent): Boolean {
+            if (autoOpening() && adjustTouch(e)) return true
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     // Not handled in other modes: as before, nothing happens.
@@ -4172,28 +4360,36 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
          * steady, with corner dots and its size.
          */
         private fun drawAutoOpening(canvas: Canvas, snap: Snapshot) {
-            val st = consensus.state ?: return
-            if (!autoFresh()) return
-            val c = st.candidate
+            val (c, _) = shownOpening() ?: return
             val vp = snap.viewProj
-            val stable = st.stable
-            val colour = if (stable) SNAP else DOOR
+            val hand = adjusted != null
+            val stable = hand || consensus.state?.stable == true
+            // Adjusted by hand: solid orange; found: dashed orange until the
+            // detections agree, then green.
+            val colour = if (hand) DOOR else if (stable) SNAP else DOOR
             val paint = if (stable) line else dashed
             paint.color = colour
             val a = c.a
             val b = c.b
             val at = a.withY(c.topY)
             val bt = b.withY(c.topY)
-            segment(canvas, vp, a, b, paint)
-            segment(canvas, vp, b, bt, paint)
-            segment(canvas, vp, bt, at, paint)
-            segment(canvas, vp, at, a, paint)
-            for (p in listOf(a, b, bt, at)) {
+            val corners = listOf(a, b, bt, at)
+            val g = adjustGrab
+            for (i in 0 until 4) {
+                // The line being dragged (or both lines at a dragged corner) in blue.
+                val held = g == 4 + i || g == i || g == (i + 1) % 4
+                paint.color = if (hand && held && g >= 0) ACCENT else colour
+                segment(canvas, vp, corners[i], corners[(i + 1) % 4], paint)
+            }
+            paint.color = colour
+            for ((i, p) in corners.withIndex()) {
                 val s = project(vp, p) ?: continue
+                // Bigger circles to grab; the held one in blue.
+                val r = if (hand) dp(9f) else dp(6f)
                 dot.color = Color.WHITE
-                canvas.drawCircle(s[0], s[1], dp(6f), dot)
-                dot.color = colour
-                canvas.drawCircle(s[0], s[1], dp(4f), dot)
+                canvas.drawCircle(s[0], s[1], r, dot)
+                dot.color = if (hand && g == i) ACCENT else colour
+                canvas.drawCircle(s[0], s[1], r - dp(2f), dot)
             }
             var text = (if (c.estimated) "≈ " else "") + sizeText(c.width, c.height)
             if (mode == Mode.WINDOW) c.sill?.let { text += " · sill ${m(it)}" }

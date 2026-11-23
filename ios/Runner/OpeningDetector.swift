@@ -126,10 +126,12 @@ struct OpeningAnalysis {
 }
 
 enum OpeningDetector {
-  /// The rectified region: ±1.6 m along the wall, from 10 cm below the base
-  /// height to 2.80 m above it.
+  /// The rectified region: ±1.6 m along the wall, from 35 cm below the base
+  /// height to 2.80 m above it (below the floor too: when the wall is
+  /// assumed too far away, the line where it meets the floor shows up below
+  /// the floor's height).
   static let halfWidth: Float = 1.6
-  static let below: Float = 0.10
+  static let below: Float = 0.35
   static let above: Float = 2.80
   /// A peak counts when it is this many times the median of its search
   /// range (edges stand out from the wall's own texture) ...
@@ -143,7 +145,10 @@ enum OpeningDetector {
   static let casingReach: Float = 15
   /// A casing edge must be at least this share of the strongest one, so a
   /// faint mark next to the frame is not taken for its inner edge.
-  static let casingShare: Float = 0.3
+  static let casingShare: Float = 0.45
+  /// A farther edge replacing a window bar (mullion, transom) is at least
+  /// this share of the bar's strength.
+  static let barStepShare: Float = 0.5
 
   // ------------------------------------------------------------ rectify
 
@@ -251,19 +256,19 @@ enum OpeningDetector {
     var colProf = [Float](repeating: .nan, count: w)
     if r1 > r0 {
       let need = max(5, (r1 - r0 + 1) / 2)
+      var vals = [Float]()
+      vals.reserveCapacity(r1 - r0 + 1)
       for c in 0..<w {
-        var s: Float = 0
-        var n = 0
+        vals.removeAll(keepingCapacity: true)
         for r in r0...r1 {
           let x = gx[r * w + c]
           if x.isNaN { continue }
-          n += 1
           // Only edges that run up and down: a slanted line (perspective of
           // something off the wall, a shadow) is not a frame's side.
           let ax = abs(x)
-          if ax > 2 * abs(gy[r * w + c]) { s += ax }
+          vals.append(ax > 2 * abs(gy[r * w + c]) ? ax : 0)
         }
-        if n >= need { colProf[c] = s / Float(n) }
+        if vals.count >= need { colProf[c] = cappedMean(&vals) }
       }
     }
     var out = OpeningAnalysis(candidate: nil, columnProfile: colProf, rowProfile: [], failure: "")
@@ -271,51 +276,106 @@ enum OpeningDetector {
     let crossCol = img.col(0)
     let left = peaks(colProf, colIndex(-halfWidth), colIndex(-0.12))
     let right = peaks(colProf, colIndex(0.12), colIndex(halfWidth))
-    // Each strong edge proposes the inside edge of its casing as a side.
-    func sides(_ ps: [Peak]) -> [(pos: Float, score: Float, prominence: Float)] {
-      var best = [Int: (pos: Float, score: Float, prominence: Float)]()
+    // Each strong edge proposes the inside edge of its casing as a side
+    // (positions in cells, 1 cm); `outer` is the casing's farthest edge.
+    func groups(_ ps: [Peak], towards: Float) -> [Side] {
+      var best = [Int: Side]()
       for anchor in ps {
-        let inner = innermost(ps, around: anchor, towards: crossCol)
+        let inner = innermost(ps, around: anchor, towards: towards)
+        let outer = outermost(ps, around: anchor, from: towards)
         if (best[inner.index]?.score ?? -1) < anchor.value {
-          best[inner.index] = (inner.pos, anchor.value, inner.prominence)
+          best[inner.index] = Side(pos: inner.pos, outer: outer.pos, score: anchor.value, prominence: inner.prominence)
         }
       }
       return Array(best.values)
     }
+
+    // Mean brightness of the cells in columns [ca, cb] and rows [ra, rb]
+    // (cell positions, either order); NaN when none.
+    func band(_ ca: Float, _ cb: Float, _ ra: Float, _ rb: Float) -> Float {
+      let c0 = max(0, Int(min(ca, cb).rounded(.up))), c1 = min(w - 1, Int(max(ca, cb).rounded(.down)))
+      let q0 = max(0, Int(min(ra, rb).rounded(.up))), q1 = min(h - 1, Int(max(ra, rb).rounded(.down)))
+      if c1 < c0 || q1 < q0 { return .nan }
+      var s: Float = 0
+      var n = 0
+      for r in q0...q1 {
+        for c in c0...c1 {
+          let x = px[r * w + c]
+          if !x.isNaN { s += x; n += 1 }
+        }
+      }
+      return n > 0 ? s / Float(n) : .nan
+    }
+    // Whether the edge group from `inner` to `outer` (cells along one axis)
+    // is a bar inside a window, a mullion or transom with glass on both
+    // sides, rather than the frame with the wall beyond it. `at` is the
+    // mean brightness of an interval of that axis.
+    func isBar(_ inner: Float, _ outer: Float, _ at: (Float, Float) -> Float) -> Bool {
+      let span = outer - inner
+      if abs(span) < 2 { return false }
+      let d: Float = span > 0 ? 1 : -1
+      let inside = at(inner - d * 10, inner - d * 3)
+      let bar = at(inner + d, outer - d)
+      let beyond = at(outer + d * 3, outer + d * 10)
+      if inside.isNaN || bar.isNaN || beyond.isNaN { return false }
+      let contrast = abs(bar - inside)
+      return contrast >= 8 && abs(beyond - inside) < 0.35 * contrast
+    }
+    // Windows: the nearest strong edge beyond a bar, else `e`.
+    func pastBars(_ e: Side, _ cands: [Side], _ at: (Float, Float) -> Float, _ ok: (Side) -> Bool) -> Side {
+      var cur = e
+      for _ in 0..<3 {
+        if !isBar(cur.pos, cur.outer, at) { return cur }
+        let d: Float = cur.outer > cur.pos ? 1 : -1
+        let farther = cands.filter { ($0.pos - cur.outer) * d > 2 && $0.score >= barStepShare * cur.score && ok($0) }
+        guard let next = farther.min(by: { abs($0.pos - cur.outer) < abs($1.pos - cur.outer) }) else { return cur }
+        cur = next
+      }
+      return cur
+    }
+
     let minW: Float = door ? 0.55 : 0.3
     let maxW: Float = door ? 2.0 : 3.0
-    var pair: (l: Float, r: Float, score: Float, prom: Float)?
-    for l in sides(left) {
-      for r in sides(right) {
+    let lefts = groups(left, towards: crossCol), rights = groups(right, towards: crossCol)
+    var pair: (l: Side, r: Side, score: Float)?
+    for l in lefts {
+      for r in rights {
         let width = img.u(r.pos) - img.u(l.pos)
         if width < minW || width > maxW { continue }
         let score = l.score + r.score
-        if score > (pair?.score ?? -1) { pair = (l.pos, r.pos, score, min(l.prominence, r.prominence)) }
+        if score > (pair?.score ?? -1) { pair = (l, r, score) }
       }
     }
-    guard let pair else {
+    guard var pair else {
       out.failure = left.isEmpty || right.isEmpty
         ? "no \(left.isEmpty ? "left" : "right") side" : "no side pair of a plausible width"
       return out
     }
-    let uL = img.u(pair.l), uR = img.u(pair.r)
+    if !door {
+      let colBand = { (a: Float, b: Float) in band(a, b, Float(r0), Float(r1)) }
+      let r = pair.r
+      pair.l = pastBars(pair.l, lefts, colBand) { img.u(r.pos) - img.u($0.pos) <= maxW }
+      let l = pair.l
+      pair.r = pastBars(pair.r, rights, colBand) { img.u($0.pos) - img.u(l.pos) <= maxW }
+    }
+    let uL = img.u(pair.l.pos), uR = img.u(pair.r.pos)
 
     // ---- top and bottom: horizontal edges between the sides
-    let c0 = max(1, Int((pair.l + 3).rounded(.up))), c1 = min(w - 2, Int((pair.r - 3).rounded(.down)))
+    let c0 = max(1, Int((pair.l.pos + 3).rounded(.up))), c1 = min(w - 2, Int((pair.r.pos - 3).rounded(.down)))
     var rowProf = [Float](repeating: .nan, count: h)
     if c1 > c0 {
       let need = max(5, (c1 - c0 + 1) / 2)
+      var vals = [Float]()
+      vals.reserveCapacity(c1 - c0 + 1)
       for r in 0..<h {
-        var s: Float = 0
-        var n = 0
+        vals.removeAll(keepingCapacity: true)
         for c in c0...c1 {
           let y = gy[r * w + c]
           if y.isNaN { continue }
-          n += 1
           let ay = abs(y)
-          if ay > 2 * abs(gx[r * w + c]) { s += ay }
+          vals.append(ay > 2 * abs(gx[r * w + c]) ? ay : 0)
         }
-        if n >= need { rowProf[r] = s / Float(n) }
+        if vals.count >= need { rowProf[r] = cappedMean(&vals) }
       }
     }
     out.rowProfile = rowProf
@@ -327,14 +387,15 @@ enum OpeningDetector {
     let (t0, t1) = door
       ? (frame.floorY.map { rows($0 + 1.8, $0 + 2.6) } ?? rows(oy + 0.6, oy + 1.5))
       : rows(oy + 0.15, oy + 1.8)
-    let tops = peaks(rowProf, t0, t1)
-    guard let strongestTop = tops.max(by: { $0.value < $1.value }) else {
+    let rowBand = { (a: Float, b: Float) in band(Float(c0), Float(c1), a, b) }
+    let tops = groups(peaks(rowProf, t0, t1), towards: crossRow)
+    guard let strongestTop = tops.max(by: { $0.score < $1.score }) else {
       out.failure = "no top edge"
       return out
     }
-    let topPeak = innermost(tops, around: strongestTop, towards: crossRow)
-    let top = img.v(topPeak.pos)
-    var prom = min(pair.prom, topPeak.prominence)
+    let topEdge = door ? strongestTop : pastBars(strongestTop, tops, rowBand) { _ in true }
+    let top = img.v(topEdge.pos)
+    var prom = min(pair.l.prominence, pair.r.prominence, topEdge.prominence)
 
     var bottom: Float
     var bottomEstimated = false
@@ -343,7 +404,7 @@ enum OpeningDetector {
         bottom = f
       } else {
         // The floor line: the strongest horizontal edge low in the region.
-        let (b0, b1) = rows(frame.base - below, frame.base + 0.30)
+        let (b0, b1) = rows(frame.base - 0.10, frame.base + 0.30)
         if let floorLine = peaks(rowProf, b0, b1).max(by: { $0.value < $1.value }) {
           bottom = img.v(floorLine.pos)
           prom = min(prom, floorLine.prominence)
@@ -355,14 +416,14 @@ enum OpeningDetector {
     } else {
       let lowest = max(oy - 1.6, (frame.floorY ?? -Float.greatestFiniteMagnitude) + 0.05)
       let (b0, b1) = rows(lowest, oy - 0.1)
-      let sills = b1 > b0 ? peaks(rowProf, b0, b1) : []
-      guard let strongest = sills.max(by: { $0.value < $1.value }) else {
+      let sills = groups(b1 > b0 ? peaks(rowProf, b0, b1) : [], towards: crossRow)
+      guard let strongest = sills.max(by: { $0.score < $1.score }) else {
         out.failure = "no sill edge"
         return out
       }
-      let sillPeak = innermost(sills, around: strongest, towards: crossRow)
-      bottom = img.v(sillPeak.pos)
-      prom = min(prom, sillPeak.prominence)
+      let sillEdge = pastBars(strongest, sills, rowBand) { _ in true }
+      bottom = img.v(sillEdge.pos)
+      prom = min(prom, sillEdge.prominence)
     }
 
     let height = top - bottom
@@ -416,6 +477,228 @@ enum OpeningDetector {
                       prominence: v / max(median, 0.05)))
     }
     return out
+  }
+
+  // ------------------------------------------------------- floor line
+
+  /// A wall placed by `wallFromFloorLine`: `moved` is how far the
+  /// crosshair's point moved (m, negative: towards the camera), `turned` how
+  /// much the wall turned (degrees), `strips` how many 10 cm strips showed
+  /// the floor line.
+  struct FloorLineWall {
+    var frame: WallFrame
+    var moved: Float
+    var turned: Float
+    var strips: Int
+  }
+
+  /// The result of `measure`: the wall used (corrected by the floor line
+  /// when `floorLine` is set), the image rectified on it and the analysis.
+  struct Measured {
+    var frame: WallFrame
+    var image: RectifiedImage
+    var analysis: OpeningAnalysis
+    var floorLine: FloorLineWall?
+  }
+
+  /// One automatic attempt: rectifies the camera image on `frame` and looks
+  /// for the door / window; then places the wall by the line where it meets
+  /// the floor (`wallFromFloorLine`) and, if that moved it, looks again on
+  /// the corrected wall. A wall that was only guessed (`estimated`) may move
+  /// up to 1.5 m and turn up to 30 degrees, and is then measured; a detected
+  /// wall surface only up to 8 cm and 8 degrees, so that a misread line can
+  /// never make it worse by more than its own error.
+  static func measure(kind: OpeningKind, frame: WallFrame, camera: CameraModel,
+                      luminance: (Float, Float) -> Float?) -> Measured {
+    let image = rectify(frame: frame, camera: camera, luminance: luminance)
+    let analysis = analyze(kind: kind, frame: frame, image: image)
+    let c = analysis.candidate
+    guard let fl = wallFromFloorLine(frame: frame, camera: camera, image: image,
+                                     skipLo: c?.left ?? .nan, skipHi: c?.right ?? .nan)
+    else { return Measured(frame: frame, image: image, analysis: analysis, floorLine: nil) }
+    let ok = frame.estimated ? abs(fl.moved) <= 1.5 && fl.turned <= 30 : abs(fl.moved) <= 0.08 && fl.turned <= 8
+    if !ok || (abs(fl.moved) < 0.003 && fl.turned < 0.3 && !frame.estimated) {
+      return Measured(frame: frame, image: image, analysis: analysis, floorLine: nil)
+    }
+    let image2 = rectify(frame: fl.frame, camera: camera, luminance: luminance)
+    return Measured(frame: fl.frame, image: image2, analysis: analyze(kind: kind, frame: fl.frame, image: image2),
+                    floorLine: fl)
+  }
+
+  /// The wall where it really is, from the line along which it meets the
+  /// floor (its base or skirting); nil when that line is not seen clearly.
+  ///
+  /// Door and window sizes are measured on the wall plane, so a wall assumed
+  /// d cm too near or too far makes them d / distance too small or too
+  /// large, and a guessed wall can be off by tens of cm. The floor, though,
+  /// is known accurately. Each 10 cm strip of the image is searched for
+  /// horizontal edges near the floor's height; the camera ray through each
+  /// meets the floor where that edge really is. Those floor points line up
+  /// along the wall's base: a line through them gives the wall's true
+  /// position and direction. Strips over the opening (skipLo...skipHi, wall
+  /// u) are left out: an open door shows the next room's floor.
+  ///
+  /// Of the lines found the best supported is used, unless one about as well
+  /// supported lies 4-30 cm nearer the camera: a skirting's top edge seen as
+  /// a floor line lands behind the wall, and the line in front of it is the
+  /// wall's base.
+  static func wallFromFloorLine(frame: WallFrame, camera: CameraModel, image img: RectifiedImage,
+                                skipLo: Float = .nan, skipHi: Float = .nan) -> FloorLineWall? {
+    guard let fy = frame.floorY else { return nil }
+    let c4 = camera.worldToCamera.inverse.columns.3
+    let cam = V3(c4.x, c4.y, c4.z)
+    if cam.y - fy < 0.4 { return nil }
+    let w = img.width, h = img.height
+    let px = img.pixels
+    let r0 = max(1, min(h - 2, Int(img.row(fy + 0.45).rounded(.up))))
+    let r1 = max(1, min(h - 2, Int(img.row(fy - 0.30).rounded(.down))))
+    if r1 - r0 < 6 { return nil }
+
+    struct Sample { var x: Float; var z: Float; var weight: Float; var strip: Int; var u: Float }
+    var samples = [Sample]()
+    let strip = 10
+    var profile = [Float](repeating: .nan, count: h)
+    var s = 0
+    var c0 = 1
+    while c0 + strip < w - 1 {
+      let uMid = img.u(Float(c0) + Float(strip) / 2)
+      let skip = !skipLo.isNaN && uMid > skipLo - 0.10 && uMid < skipHi + 0.10
+      if !skip {
+        for i in profile.indices { profile[i] = .nan }
+        for r in r0...r1 {
+          var sum: Float = 0
+          var n = 0
+          for c in c0..<(c0 + strip) {
+            let i = r * w + c
+            let a = px[i - w - 1], b = px[i - w], cc = px[i - w + 1]
+            let d = px[i - 1], f = px[i + 1]
+            let g = px[i + w - 1], hh = px[i + w], k = px[i + w + 1]
+            let gx = ((cc + 2 * f + k) - (a + 2 * d + g)) / 8
+            let gy = ((g + 2 * hh + k) - (a + 2 * b + cc)) / 8
+            if gx.isNaN || gy.isNaN { continue }
+            n += 1
+            if abs(gy) > 2 * abs(gx) { sum += abs(gy) }
+          }
+          profile[r] = n >= strip / 2 ? sum / Float(n) : 0
+        }
+        let found = peaks(profile, r0, r1).sorted { $0.value > $1.value }.prefix(3)
+        for pk in found {
+          let q = frame.point(uMid, img.v(pk.pos))
+          let dir = q - cam
+          if dir.y > -1e-3 { continue }
+          let t = (fy - cam.y) / dir.y
+          let x = cam.x + dir.x * t, z = cam.z + dir.z * t
+          let dist = ((x - cam.x) * (x - cam.x) + (z - cam.z) * (z - cam.z)).squareRoot()
+          if dist < 0.3 || dist > 10 { continue }
+          samples.append(Sample(x: x, z: z, weight: pk.value, strip: s, u: uMid))
+        }
+      }
+      c0 += strip
+      s += 1
+    }
+    if samples.count < 4 { return nil }
+
+    struct Line { var px: Float; var pz: Float; var nx: Float; var nz: Float; var support: Float; var inliers: [Sample] }
+    // Every pair of samples from strips at least 30 cm apart proposes a
+    // line; its support is the summed strength of the strips with a sample
+    // within 3 cm of it (each strip's strongest one).
+    var lines = [Line]()
+    let maxTilt: Float = 0.42 // sin(25 degrees): roughly along the assumed wall
+    let wn = frame.normal
+    for i in samples.indices {
+      for j in (i + 1)..<samples.count {
+        let a = samples[i], b = samples[j]
+        if abs(a.u - b.u) < 0.3 { continue }
+        let l = ((b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z)).squareRoot()
+        if l < 0.2 { continue }
+        let dx = (b.x - a.x) / l, dz = (b.z - a.z) / l
+        if abs(dx * wn.x + dz * wn.z) > maxTilt { continue }
+        let nx = -dz, nz = dx
+        var best = [Int: Sample]()
+        for q in samples where abs((q.x - a.x) * nx + (q.z - a.z) * nz) <= 0.03 {
+          if (best[q.strip]?.weight ?? -1) < q.weight { best[q.strip] = q }
+        }
+        if best.count < 4 { continue }
+        let inl = Array(best.values)
+        let us = inl.map { $0.u }
+        if (us.max() ?? 0) - (us.min() ?? 0) < 0.5 { continue }
+        lines.append(Line(px: a.x, pz: a.z, nx: nx, nz: nz, support: inl.reduce(0) { $0 + $1.weight }, inliers: inl))
+      }
+    }
+    guard let top = lines.max(by: { $0.support < $1.support }) else { return nil }
+    // Distance of a line from the camera.
+    func depth(_ l: Line) -> Float { abs((l.px - cam.x) * l.nx + (l.pz - cam.z) * l.nz) }
+    let nearer = lines.filter {
+      $0.support >= 0.6 * top.support && abs($0.nx * top.nx + $0.nz * top.nz) > 0.996 &&
+        (0.04...0.30).contains(depth(top) - depth($0))
+    }
+    let chosen = nearer.max(by: { $0.support < $1.support }) ?? top
+
+    // Least-squares line through the chosen inliers.
+    let inl = chosen.inliers
+    let mx = inl.reduce(0) { $0 + $1.x } / Float(inl.count)
+    let mz = inl.reduce(0) { $0 + $1.z } / Float(inl.count)
+    var sxx: Float = 0, sxz: Float = 0, szz: Float = 0
+    for q in inl {
+      let dx = q.x - mx, dz = q.z - mz
+      sxx += dx * dx
+      sxz += dx * dz
+      szz += dz * dz
+    }
+    let ang = 0.5 * atan2(2 * sxz, sxx - szz)
+    var nx = -sin(ang), nz = cos(ang)
+    // Facing the camera.
+    if (cam.x - mx) * nx + (cam.z - mz) * nz < 0 {
+      nx = -nx
+      nz = -nz
+    }
+    // The crosshair's point: where its ray (camera to the old origin) meets
+    // the new wall.
+    let o = frame.origin
+    let ray = o - cam
+    let den = ray.x * nx + ray.z * nz
+    if abs(den) < 1e-3 { return nil }
+    let k = ((mx - cam.x) * nx + (mz - cam.z) * nz) / den
+    if k <= 0 { return nil }
+    let origin = cam + ray * k
+    let dOrigin = origin - o
+    let moved = (dOrigin.x * dOrigin.x + dOrigin.z * dOrigin.z).squareRoot() * (k < 1 ? -1 : 1)
+    let cosTurn = min(max(nx * wn.x + nz * wn.z, -1), 1)
+    let turned = acos(cosTurn) * 180 / .pi
+    let wall = WallFrame(origin: origin, normal: V3(nx, 0, nz), floorY: fy, estimated: false)
+    return FloorLineWall(frame: wall, moved: moved, turned: turned, strips: inl.count)
+  }
+
+  /// A side, top or bottom edge group: `pos` its inside edge, `outer` its
+  /// outside edge (cells), `score` its strongest edge's strength.
+  private struct Side {
+    var pos: Float
+    var outer: Float
+    var score: Float
+    var prominence: Float
+  }
+
+  /// Mean of `v` (reordered) with each value capped at the 75th
+  /// percentile: an edge counts by how strong it is along most of its
+  /// length, so a short bright feature (a door handle, a light switch) next
+  /// to a frame does not outweigh the frame's own edge.
+  private static func cappedMean(_ v: inout [Float]) -> Float {
+    if v.isEmpty { return 0 }
+    v.sort()
+    let cap = v[min(v.count - 1, v.count * 3 / 4)]
+    var s: Float = 0
+    for x in v { s += min(x, cap) }
+    return s / Float(v.count)
+  }
+
+  /// Of the strong edges within casingReach of `anchor`, the one farthest
+  /// from `from` (the crosshair): the outside edge of a casing or frame.
+  private static func outermost(_ ps: [Peak], around anchor: Peak, from: Float) -> Peak {
+    var best = anchor
+    for p in ps where abs(p.pos - anchor.pos) <= casingReach && p.value >= casingShare * anchor.value {
+      if abs(p.pos - from) > abs(best.pos - from) { best = p }
+    }
+    return best
   }
 
   /// Of the strong edges within casingReach of `anchor`, the one nearest to

@@ -299,7 +299,21 @@ enum RoomDetector {
 
     /// The wall made of the points within `half` of `centre`, if they are
     /// enough and spread along the wall.
-    func wallAt(_ centre: Float, _ half: Float) -> AxisWall? {
+    func wallAt(_ start: Float, _ half: Float) -> AxisWall? {
+      // The histogram peak is only as exact as its bins, and with noisy
+      // points (far walls) a window around it is lopsided: move the window to
+      // the mean of its points a few times (at most 3 cm, so it can't slide
+      // onto a surface in front of the wall).
+      var centre = start
+      for _ in 0..<3 {
+        var s: Float = 0
+        var n = 0
+        for o in off where abs(o - centre) < half {
+          s += o
+          n += 1
+        }
+        if n > 0 { centre = min(max(s / Float(n), start - 0.03), start + 0.03) }
+      }
       var sum: Float = 0
       var alongPts = [Float]()
       var heights = [Float]()

@@ -288,7 +288,21 @@ internal object RoomDetector {
 
         /** The wall made of the points within [half] of [centre], if they
          *  are enough and spread along the wall. */
-        fun wallAt(centre: Float, half: Float): AxisWall? {
+        fun wallAt(start: Float, half: Float): AxisWall? {
+            // The histogram peak is only as exact as its bins, and with noisy
+            // points (far walls) a window around it is lopsided: move the
+            // window to the mean of its points a few times (at most 3 cm, so
+            // it can't slide onto a surface in front of the wall).
+            var centre = start
+            repeat(3) {
+                var s = 0f
+                var n = 0
+                for (o in off) if (abs(o - centre) < half) {
+                    s += o
+                    n++
+                }
+                if (n > 0) centre = (s / n).coerceIn(start - 0.03f, start + 0.03f)
+            }
             var sum = 0f
             val alongPts = ArrayList<Float>()
             val heights = ArrayList<Float>()

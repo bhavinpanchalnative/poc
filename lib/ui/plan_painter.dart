@@ -55,6 +55,8 @@ class PlanPainter extends CustomPainter {
     this.title,
     this.layout,
     this.editing = false,
+    this.handles = false,
+    this.highlightLine,
     this.zoom = 1.0,
   });
 
@@ -67,8 +69,15 @@ class PlanPainter extends CustomPainter {
   /// Fixed layout (used while dragging a corner); fitted to the size if null.
   final PlanLayout? layout;
 
-  /// Draws draggable corner handles.
+  /// Edit-shape mode: no corner angles or scale bar.
   final bool editing;
+
+  /// Draws the draggable circles: every corner and both ends of every
+  /// line (on screen only, never in exports).
+  final bool handles;
+
+  /// The line whose end is being dragged (highlighted).
+  final int? highlightLine;
 
   /// Current zoom of the surrounding viewer, to keep handles a constant size.
   final double zoom;
@@ -139,8 +148,8 @@ class PlanPainter extends CustomPainter {
     for (var i = 0; i < plan.wallCount; i++) {
       _drawDimension(canvas, i, wallPx);
     }
-    for (final l in plan.lines) {
-      _drawLine(canvas, l);
+    for (var k = 0; k < plan.lines.length; k++) {
+      _drawLine(canvas, plan.lines[k], on: k == highlightLine);
     }
     if (!editing) _drawCornerAngles(canvas, wallPx);
 
@@ -153,7 +162,7 @@ class PlanPainter extends CustomPainter {
           c + const Offset(0, 20),
           size: 11, color: quiet);
     }
-    if (editing) _drawHandles(canvas);
+    if (handles || editing) _drawHandles(canvas);
     if (!editing) _drawScaleBar(canvas, size);
   }
 
@@ -309,7 +318,7 @@ class PlanPainter extends CustomPainter {
 
   /// A point-to-point distance: a dashed line between its two ends as seen
   /// from above, with the measured length (which may include height).
-  void _drawLine(Canvas canvas, MeasuredLine l) {
+  void _drawLine(Canvas canvas, MeasuredLine l, {bool on = false}) {
     if (l.footprint.length < 2) return;
     final a = _p(l.footprint[0]), b = _p(l.footprint[1]);
     final paint = Paint()
@@ -323,8 +332,18 @@ class PlanPainter extends CustomPainter {
         canvas.drawLine(a + step * t, a + step * math.min(t + 6, len), paint);
       }
     }
-    canvas.drawCircle(a, 3.5, paint);
-    canvas.drawCircle(b, 3.5, paint);
+    if (handles) {
+      // Draggable ends: a ring like the corners', in the line's colour.
+      final r = (on ? 8 : 7) / zoom;
+      for (final e in [a, b]) {
+        canvas.drawCircle(e, r + 2 / zoom, Paint()..color = paper);
+        canvas.drawCircle(e, r, Paint()..color = on ? accent : lineColor);
+        canvas.drawCircle(e, r * 0.4, Paint()..color = paper);
+      }
+    } else {
+      canvas.drawCircle(a, 3.5, paint);
+      canvas.drawCircle(b, 3.5, paint);
+    }
     _text(canvas,
         '${l.name}  ${l.estimated ? '≈ ' : ''}${formatLength(l.length, unit)}',
         (a + b) / 2,
@@ -447,6 +466,8 @@ class PlanPainter extends CustomPainter {
       old.title != title ||
       old.layout != layout ||
       old.editing != editing ||
+      old.handles != handles ||
+      old.highlightLine != highlightLine ||
       old.zoom != zoom;
 }
 

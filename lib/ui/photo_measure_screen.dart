@@ -41,6 +41,18 @@ class _PhotoMeasureScreenState extends State<PhotoMeasureScreen> {
   final _viewer = TransformationController();
   bool _saving = false;
 
+  // A point being dragged: in _dragList (_refPts or _cornerPts) at
+  // _dragIndex, by pointer _dragPointer; where it was, to put it back.
+  List<Vec2>? _dragList;
+  int _dragIndex = 0;
+  int? _dragPointer;
+  Vec2? _dragOriginal;
+  Offset _dragFrom = Offset.zero;
+  bool _dragMoved = false;
+
+  /// The finger that just lifted was on a point: its tap adds no new one.
+  bool _suppressTap = false;
+
   LengthUnit get unit => AppSettings.unit.value;
   bool get _refDone => _refPts.length == 4;
 
@@ -115,7 +127,83 @@ class _PhotoMeasureScreenState extends State<PhotoMeasureScreen> {
     if (picked != null) setState(() => _ref = picked);
   }
 
+  /// A finger down on a point grabs it (s: image to view pixels): the photo
+  /// stops panning and zooming until it is let go.
+  void _pointerDown(PointerDownEvent e, double s) {
+    if (_dragPointer != null) {
+      // A second finger: a pinch, not a drag. Put the point back.
+      _endDrag(restore: true);
+      return;
+    }
+    _suppressTap = false;
+    final zoom = _viewer.value.getMaxScaleOnAxis();
+    final reach = 26 / zoom; // view pixels inside the viewer
+    List<Vec2>? list;
+    var index = 0;
+    var best = reach;
+    for (final l in [_cornerPts, _refPts]) {
+      for (var i = 0; i < l.length; i++) {
+        final d = (Offset(l[i].x * s, l[i].y * s) - e.localPosition).distance;
+        if (d < best) {
+          best = d;
+          list = l;
+          index = i;
+        }
+      }
+    }
+    if (list == null) return;
+    _suppressTap = true;
+    setState(() {
+      _dragPointer = e.pointer;
+      _dragList = list;
+      _dragIndex = index;
+      _dragOriginal = list![index];
+      _dragFrom = e.localPosition;
+      _dragMoved = false;
+    });
+  }
+
+  void _pointerMove(PointerMoveEvent e, double s) {
+    final list = _dragList, img = _image;
+    if (e.pointer != _dragPointer || list == null || img == null) return;
+    if (!_dragMoved && (e.localPosition - _dragFrom).distance < 4) return;
+    _dragMoved = true;
+    setState(() => list[_dragIndex] = Vec2(
+          (e.localPosition.dx / s).clamp(0.0, img.width.toDouble()),
+          (e.localPosition.dy / s).clamp(0.0, img.height.toDouble()),
+        ));
+  }
+
+  void _pointerUp(PointerEvent e) {
+    if (e.pointer != _dragPointer) return;
+    // A room corner must stay where the photo shows floor.
+    final bad = _dragMoved && _refDone && _cornerPts.length >= 2 && _floor == null;
+    _endDrag(restore: bad);
+    if (bad) {
+      showMessage(
+          context,
+          "That point isn't on the floor as seen in the photo. Drag it to "
+          'where the wall meets the floor.');
+    }
+  }
+
+  void _endDrag({required bool restore}) {
+    final list = _dragList, original = _dragOriginal;
+    setState(() {
+      if (restore && list != null && original != null) list[_dragIndex] = original;
+      _dragPointer = null;
+      _dragList = null;
+      _dragOriginal = null;
+      _dragMoved = false;
+    });
+  }
+
   void _tap(Vec2 p) {
+    if (_suppressTap) {
+      // The tap was on an existing point (or ended a drag of one).
+      _suppressTap = false;
+      return;
+    }
     setState(() {
       if (!_refDone) {
         _refPts.add(p);
@@ -205,7 +293,8 @@ class _PhotoMeasureScreenState extends State<PhotoMeasureScreen> {
           'floor, in order around the room (${_cornerPts.length} so far). '
           'With 3 corners the room is completed as a rectangle.';
     }
-    return 'Tap more corners for an L-shaped room, or create the room.';
+    return 'Tap more corners for an L-shaped room, or create the room. '
+        'Drag any point to adjust it.';
   }
 
   Widget _photoView() {
@@ -217,24 +306,35 @@ class _PhotoMeasureScreenState extends State<PhotoMeasureScreen> {
         child: InteractiveViewer(
           transformationController: _viewer,
           maxScale: 8,
+          // Off while a point is held, so the drag moves the point.
+          panEnabled: _dragPointer == null,
+          scaleEnabled: _dragPointer == null,
           child: SizedBox(
             width: w,
             height: h,
-            child: GestureDetector(
-              onTapUp: (d) => _tap(Vec2(
-                  d.localPosition.dx / s, d.localPosition.dy / s)),
-              child: Stack(fit: StackFit.expand, children: [
-                RawImage(image: img, fit: BoxFit.fill),
-                CustomPaint(
-                  painter: _MarksPainter(
-                    refPts: _refPts,
-                    cornerPts: _cornerPts,
-                    floor: _floor,
-                    unit: unit,
-                    viewScale: s,
+            child: Listener(
+              onPointerDown: (e) => _pointerDown(e, s),
+              onPointerMove: (e) => _pointerMove(e, s),
+              onPointerUp: _pointerUp,
+              onPointerCancel: (e) {
+                if (e.pointer == _dragPointer) _endDrag(restore: true);
+              },
+              child: GestureDetector(
+                onTapUp: (d) => _tap(Vec2(
+                    d.localPosition.dx / s, d.localPosition.dy / s)),
+                child: Stack(fit: StackFit.expand, children: [
+                  RawImage(image: img, fit: BoxFit.fill),
+                  CustomPaint(
+                    painter: _MarksPainter(
+                      refPts: _refPts,
+                      cornerPts: _cornerPts,
+                      floor: _floor,
+                      unit: unit,
+                      viewScale: s,
+                    ),
                   ),
-                ),
-              ]),
+                ]),
+              ),
             ),
           ),
         ),

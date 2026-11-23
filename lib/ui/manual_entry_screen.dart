@@ -5,10 +5,15 @@ import '../engine/models.dart';
 import '../engine/units.dart';
 import '../services/app_settings.dart';
 import 'common.dart';
+import 'plan_painter.dart';
 
 enum _Shape { rectangle, custom }
 
 class _WallRow {
+  _WallRow(VoidCallback onChanged) {
+    length.addListener(onChanged);
+  }
+
   final length = TextEditingController();
   bool left = true;
 }
@@ -29,49 +34,119 @@ class _ManualEntryScreenState extends State<ManualEntryScreen> {
   final _length = TextEditingController();
   final _width = TextEditingController();
   final _height = TextEditingController();
-  final _walls = [for (var i = 0; i < 4; i++) _WallRow()];
+  late final _walls = [for (var i = 0; i < 4; i++) _WallRow(_typed)];
   var _shape = _Shape.rectangle;
 
   LengthUnit get unit => AppSettings.unit.value;
 
-  void _create() {
-    if (!_form.currentState!.validate()) return;
+  @override
+  void initState() {
+    super.initState();
+    for (final c in [_length, _width, _height]) {
+      c.addListener(_typed);
+    }
+  }
+
+  /// A measurement was typed: the floor plan preview follows.
+  void _typed() {
+    if (mounted) setState(() {});
+  }
+
+  /// The room as typed so far, or why it can't be drawn yet.
+  ({RoomScan? scan, String? problem}) _room() {
     final List<double> lengths;
     final List<double> turns;
+    double? len(TextEditingController c) {
+      final v = parseLength(c.text, unit);
+      return v == null || v.isNaN || v <= 0 ? null : v;
+    }
+
     if (_shape == _Shape.rectangle) {
-      final l = parseLength(_length.text, unit)!;
-      final w = parseLength(_width.text, unit)!;
+      final l = len(_length), w = len(_width);
+      if (l == null || w == null) {
+        return (scan: null, problem: 'Enter the length and width to see the floor plan.');
+      }
       lengths = [l, w, l, w];
       turns = [90, 90, 90, 90];
     } else {
-      lengths = [for (final r in _walls) parseLength(r.length.text, unit)!];
+      final ls = [for (final r in _walls) len(r.length)];
+      if (ls.any((l) => l == null)) {
+        return (scan: null, problem: 'Enter every wall to see the floor plan.');
+      }
+      lengths = [for (final l in ls) l!];
       turns = [for (final r in _walls) r.left ? 90.0 : -90.0];
       final sum = turns.fold(0.0, (a, b) => a + b);
       if (sum.abs() != 360) {
-        showMessage(
-            context,
-            'The turns don\'t close the room. A room needs 4 more turns one '
-            'way than the other (now ${(sum / 90).round().abs()}).');
-        return;
+        return (
+          scan: null,
+          problem: 'The turns don\'t close the room. A room needs 4 more turns one '
+              'way than the other (now ${(sum / 90).round().abs()}).'
+        );
       }
     }
     final scan = RoomScan(
       id: RoomScan.newId(),
-      name: _name.text.trim().isEmpty ? widget.defaultName : _name.text.trim(),
+      name: _name.text.trim(),
       createdAt: DateTime.now(),
       source: CaptureSource.manual,
       walls: wallsFromLengths(lengths, turns),
-      height: _height.text.trim().isEmpty
-          ? null
-          : parseLength(_height.text, unit),
+      height: _height.text.trim().isEmpty ? null : len(_height),
     );
     try {
       const FloorPlanBuilder().build(scan);
     } on PlanException catch (e) {
-      showMessage(context, e.message);
+      return (scan: null, problem: e.message);
+    }
+    return (scan: scan, problem: null);
+  }
+
+  void _create() {
+    if (!_form.currentState!.validate()) return;
+    final r = _room();
+    final scan = r.scan;
+    if (scan == null) {
+      showMessage(context, r.problem ?? 'Check the measurements.');
       return;
     }
     Navigator.pop(context, scan);
+  }
+
+  /// The floor plan of what is typed, drawn as soon as it is complete and
+  /// redrawn with every change.
+  Widget _preview(ThemeData theme) {
+    final r = _room();
+    final scan = r.scan;
+    FloorPlan? plan;
+    if (scan != null) {
+      try {
+        plan = const FloorPlanBuilder().build(scan);
+      } on PlanException {
+        plan = null;
+      }
+    }
+    if (plan == null) {
+      return SizedBox(
+        height: 120,
+        child: Center(
+          child: Text(
+            r.problem ?? 'Enter the measurements to see the floor plan.',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodyMedium
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+        ),
+      );
+    }
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: AspectRatio(
+        aspectRatio: 1.2,
+        child: CustomPaint(
+          key: const ValueKey('manual-plan-preview'),
+          painter: PlanPainter(plan: plan, unit: unit),
+        ),
+      ),
+    );
   }
 
   Widget _section(Widget child) => Card(
@@ -107,6 +182,9 @@ class _ManualEntryScreenState extends State<ManualEntryScreen> {
                   controller: _name,
                   textCapitalization: TextCapitalization.sentences,
                   decoration: const InputDecoration(labelText: 'Room name'),
+                  // Mandatory: the room is not created without a name.
+                  autovalidateMode: AutovalidateMode.onUserInteraction,
+                  validator: (v) => isUnnamed(v ?? '') ? nameNeeded : null,
                 ),
               ),
               const SectionLabel('Shape'),
@@ -192,7 +270,7 @@ class _ManualEntryScreenState extends State<ManualEntryScreen> {
                       alignment: Alignment.centerLeft,
                       child: TextButton.icon(
                         onPressed: () =>
-                            setState(() => _walls.add(_WallRow())),
+                            setState(() => _walls.add(_WallRow(_typed))),
                         icon: const Icon(Icons.add_rounded),
                         label: const Text('Add wall'),
                       ),
@@ -200,6 +278,8 @@ class _ManualEntryScreenState extends State<ManualEntryScreen> {
                   ],
                 ],
               )),
+              const SectionLabel('Floor plan'),
+              _section(_preview(theme)),
               const SectionLabel('Height'),
               _section(
                 LengthField(

@@ -424,6 +424,8 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   private var autoOpening: AutoOpening?
   /// No wall plane could be found for the last attempt.
   private var autoWallMissing = false
+  /// When the floor-line wall correction was last logged.
+  private var lastFloorLineDiag: CFTimeInterval = 0
   /// Since when nothing has been found (searching started, or the last
   /// detection), for the "can't find the frame" advice.
   private var autoNothingSince = Date()
@@ -434,6 +436,37 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   /// drop out for a frame, and a tap a moment after the frame turned green
   /// must still add it.
   private var lastStableOpening: (opening: AutoOpening, at: Date)?
+
+  /// The door / window found, adjusted by hand on the camera view. Its
+  /// wall is the vertical plane through the bottom corners it was found
+  /// with; left / right run along it (m from `origin`). Once the user drags
+  /// one of its circles or lines it no longer follows new detections; ✓
+  /// adds it as adjusted, Undo goes back to automatic.
+  private struct AdjustedOpening {
+    let origin: V3
+    /// Horizontal unit vector along the wall (bottom-left to bottom-right).
+    let along: V3
+    var left: Float
+    var right: Float
+    var bottom: Float
+    var top: Float
+    let estimated: Bool
+
+    var opening: AutoOpening {
+      let a = (origin + along * left).withY(bottom)
+      let b = (origin + along * right).withY(bottom)
+      return AutoOpening(a: a, b: b, bottom: bottom, top: top, estimated: estimated, stable: true)
+    }
+  }
+
+  private var adjusted: AdjustedOpening?
+  /// What the finger holds: corners 0-3 (bottom-left, bottom-right,
+  /// top-right, top-left), edges 4-7 (bottom, right, top, left); -1 none.
+  private var adjustGrab = -1
+
+  /// The frame drawn on the camera view: the hand-adjusted one, else the
+  /// detection.
+  private var shownOpening: AutoOpening? { adjusted?.opening ?? autoOpening }
   private var lastOpeningShot: OpeningShot?
   private var lastOpeningDiagWrite = Date.distantPast
   /// Tracking has been normal since the last Start over.
@@ -1424,8 +1457,9 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     }
 
     // f. A door stands on the floor: the floor at the bottom of the view is
-    // taken as its foot, on a plane facing the camera.
-    if mode == .door, let fy = floorY,
+    // taken as its foot, on a plane facing the camera. (Windows too: the
+    // floor line then has to place the wall; see maybeDetectOpening.)
+    if let fy = floorY,
        let (bo, bd) = screenRay(CGPoint(x: size.width / 2, y: size.height), frame), bd.y < -0.05 {
       let t = (fy - bo.y) / bd.y
       if t > 0.3 && t < 8, let f = make(bo + bd * t, facing, "floor", estimated: true) { return f }
@@ -1512,10 +1546,25 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       DispatchQueue.main.async {
         guard let self else { return }
         self.openingBusy = false
-        guard gen == self.openingGen, self.openingAuto, !self.completed,
-              let (image, analysis) = result else { return }
-        self.noteOpeningAttempt(OpeningShot(image: image, analysis: analysis, wall: wall,
-                                            source: source, kind: kind))
+        guard gen == self.openingGen, self.openingAuto, !self.completed, let result else { return }
+        // The wall is placed by where it meets the floor when that line is in
+        // view (OpeningDetector.measure): a detected wall a few cm out, or a
+        // guessed one, made the door / window that much too small or large.
+        if let fl = result.floorLine, CACurrentMediaTime() - self.lastFloorLineDiag > 2 {
+          self.lastFloorLineDiag = CACurrentMediaTime()
+          self.diag(String(format: "opening wall %@ corrected by the floor line: %+.1f cm, %.1f°, %d strips",
+                           source, fl.moved * 100, fl.turned, fl.strips))
+        }
+        // A window's wall taken through the floor at the bottom of the view
+        // is only a guess, of no use unless the floor line confirmed it.
+        if result.floorLine == nil && source == "floor" && kind == .window {
+          if !self.autoWallMissing { self.diag("auto window: floor-guessed wall not confirmed by a floor line") }
+          self.autoWallMissing = true
+          return
+        }
+        self.noteOpeningAttempt(OpeningShot(image: result.image, analysis: result.analysis, wall: result.frame,
+                                            source: result.floorLine == nil ? source : source + "+floor line",
+                                            kind: kind))
       }
     }
   }
@@ -1523,7 +1572,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   /// Resamples the camera image's luminance (the Y plane) onto the wall and
   /// looks for the frame. Runs on openingQueue.
   private static func detectOpening(_ buf: CVPixelBuffer, _ model: CameraModel, _ wall: WallFrame,
-                                    _ kind: OpeningKind) -> (RectifiedImage, OpeningAnalysis)? {
+                                    _ kind: OpeningKind) -> OpeningDetector.Measured? {
     CVPixelBufferLockBaseAddress(buf, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
     let planar = CVPixelBufferIsPlanar(buf)
@@ -1538,7 +1587,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     // on current devices, scaled in case it ever differs.
     let sx = Float(pw) / Float(model.width), sy = Float(ph) / Float(model.height)
     let maxX = Float(pw - 1), maxY = Float(ph - 1)
-    let image = OpeningDetector.rectify(frame: wall, camera: model) { x, y in
+    return OpeningDetector.measure(kind: kind, frame: wall, camera: model) { x, y in
       let fx = x * sx, fy = y * sy
       if !(fx >= 0 && fy >= 0 && fx <= maxX && fy <= maxY) { return nil }
       let x0 = min(Int(fx), pw - 2), y0 = min(Int(fy), ph - 2)
@@ -1549,13 +1598,14 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       let bottom = Float(r1[0]) * (1 - ax) + Float(r1[1]) * ax
       return top * (1 - ay) + bottom * ay
     }
-    return (image, OpeningDetector.analyze(kind: kind, frame: wall, image: image))
   }
 
   private func clearAutoSamples() {
     autoSamples.removeAll()
     autoOpening = nil
     lastStableOpening = nil
+    adjusted = nil
+    adjustGrab = -1
   }
 
   /// Starts the automatic search afresh (mode or method switch, an opening
@@ -1631,7 +1681,11 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     let now = Date()
     var settled = true
     var picked: AutoOpening?
-    if let o = autoOpening, o.stable {
+    let byHand = adjusted != nil
+    if let adj = adjusted {
+      // Adjusted by hand: exactly as the user left it.
+      picked = adj.opening
+    } else if let o = autoOpening, o.stable {
       picked = o
     } else if let last = lastStableOpening, now.timeIntervalSince(last.at) <= Self.stableGrace {
       picked = last.opening
@@ -1662,7 +1716,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     resetAutoSearch()
     autoSuppress = (centre, Date().addingTimeInterval(2))
     diag("\(mode.label.lowercased()) \(openings.count) (auto, wall \(lastOpeningShot?.source ?? "-")"
-      + "\(o.estimated ? ", estimated" : "")): \(openingSize(o, fy))")
+      + "\(o.estimated ? ", estimated" : "")\(byHand ? ", adjusted by hand" : "")): \(openingSize(o, fy))")
     notifyHaptics.notificationOccurred(.success)
     focusOpening = openings.count - 1
     diag("\(mode.label.lowercased()) added with ✓: finishing the scan")
@@ -2113,6 +2167,10 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   /// Door / Window mode, Auto: what the search is doing.
   private func autoInstruction() -> String {
     let isDoor = mode == .door
+    if adjusted != nil {
+      return "Drag the circles or lines onto the \(isDoor ? "door" : "window")'s frame, then tap ✓. "
+        + "Undo goes back to automatic."
+    }
     if autoWallMissing {
       return "Point at the wall around the \(isDoor ? "door" : "window") so it can be found."
     }
@@ -2126,7 +2184,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     }
     return isDoor
       ? "Point at the middle of the door. Keep the whole frame and the floor below it in view."
-      : "Point at the middle of the window. Keep the whole window frame in view."
+      : "Point at the middle of the window. Keep the whole window frame, and the bottom of the wall below it if you can, in view."
   }
 
   @objc private func onMark() {
@@ -2281,12 +2339,100 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
 
   /// A touch on one of the cards is not a tap on the scene. Some of them
   /// (labels, the gaps of a stack) would otherwise let it through.
+  /// The camera view takes touches: line points (Line, Aim), or dragging
+  /// the door / window frame found (Door / Window, Auto).
+  private var touchEnabled: Bool { tapEnabled || (openingAuto && !completing && !completed) }
+
   fileprivate func tapAllowed(at p: CGPoint) -> Bool {
-    if !tapEnabled { return false }
+    if !touchEnabled { return false }
     for v in [topStack, bottomPanel, completionCard] {
       if let v, !v.isHidden, v.convert(v.bounds, to: tapView).contains(p) { return false }
     }
+    // Door / Window: only on the frame's circles and lines; elsewhere the
+    // touch goes on to the controls below as before.
+    if !tapEnabled { return openingHit(at: p) != nil }
     return true
+  }
+
+  /// The circle (0-3) or, away from them, the line (4-7) of the door /
+  /// window frame shown under a finger at `p`.
+  private func openingHit(at p: CGPoint) -> Int? {
+    guard openingAuto, let vp = snapshot?.viewProj, let o = shownOpening else { return nil }
+    let size = tapView.bounds.size
+    let corners = [o.a, o.b, o.b.withY(o.top), o.a.withY(o.top)]
+    let s = corners.map { project(vp, $0, size) }
+    var best: Int?
+    var bestD: CGFloat = 32
+    for (i, q) in s.enumerated() {
+      guard let q else { continue }
+      let d = hypot(q.x - p.x, q.y - p.y)
+      if d < bestD {
+        bestD = d
+        best = i
+      }
+    }
+    if best != nil { return best }
+    bestD = 24
+    for i in 0..<4 {
+      guard let a = s[i], let b = s[(i + 1) % 4] else { continue }
+      let dx = b.x - a.x, dy = b.y - a.y
+      let len2 = dx * dx + dy * dy
+      let t = len2 > 0 ? min(max(((p.x - a.x) * dx + (p.y - a.y) * dy) / len2, 0), 1) : 0
+      let d = hypot(a.x + dx * t - p.x, a.y + dy * t - p.y)
+      if d < bestD {
+        bestD = d
+        best = 4 + i
+      }
+    }
+    return best
+  }
+
+  /// A finger down on the frame found grabs that circle or line; the frame
+  /// then stays as the user leaves it.
+  private func grabOpening(at p: CGPoint) {
+    guard let hit = openingHit(at: p), let o = shownOpening else { return }
+    if adjusted == nil {
+      let d = o.b - o.a
+      let len = (d.x * d.x + d.z * d.z).squareRoot()
+      if len < 0.05 { return }
+      adjusted = AdjustedOpening(origin: o.a.withY(0), along: V3(d.x / len, 0, d.z / len),
+                                 left: 0, right: len, bottom: o.bottom, top: o.top, estimated: o.estimated)
+      diag("auto \(mode.label.lowercased()): adjusting by hand")
+    }
+    adjustGrab = hit
+    lightHaptics.impactOccurred()
+  }
+
+  /// The grabbed circle or line follows the finger, on the frame's wall.
+  private func dragOpening(to p: CGPoint) {
+    guard var adj = adjusted, adjustGrab >= 0, let frame = sceneView.session.currentFrame,
+          let (o, d) = screenRay(p, frame) else { return }
+    // The wall: vertical, through the bottom corners, normal across `along`.
+    let n = V3(-adj.along.z, 0, adj.along.x)
+    let den = d.x * n.x + d.z * n.z
+    if abs(den) < 0.05 { return }
+    let t = ((adj.origin.x - o.x) * n.x + (adj.origin.z - o.z) * n.z) / den
+    if t <= 0.1 || t > 15 { return }
+    let q = o + d * t
+    let u = (q.x - adj.origin.x) * adj.along.x + (q.z - adj.origin.z) * adj.along.z
+    let v = q.y
+    let gap: Float = 0.10 // smallest width / height
+    func setLeft() { adj.left = min(u, adj.right - gap) }
+    func setRight() { adj.right = max(u, adj.left + gap) }
+    func setBottom() { adj.bottom = min(v, adj.top - gap) }
+    func setTop() { adj.top = max(v, adj.bottom + gap) }
+    switch adjustGrab {
+    case 0: setLeft(); setBottom()
+    case 1: setRight(); setBottom()
+    case 2: setRight(); setTop()
+    case 3: setLeft(); setTop()
+    case 4: setBottom()
+    case 5: setRight()
+    case 6: setTop()
+    case 7: setLeft()
+    default: return
+    }
+    adjusted = adj
   }
 
   private func linePick(at p: CGPoint) -> (point: V3, estimated: Bool)? {
@@ -2296,7 +2442,13 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
 
   /// A finger went down on the camera view (`began`) or moved on it.
   fileprivate func tapMoved(to p: CGPoint, began: Bool) {
-    if !tapEnabled || (!began && tapPreview == nil) { return }
+    if !tapEnabled {
+      // Door / Window: dragging the frame found.
+      if began { grabOpening(at: p) } else { dragOpening(to: p) }
+      overlay.setNeedsDisplay()
+      return
+    }
+    if !began && tapPreview == nil { return }
     let now = CACurrentMediaTime()
     if began || now - lastTapPick >= 1.0 / 30 {
       lastTapPick = now
@@ -2311,6 +2463,11 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
 
   /// The finger was lifted: the point under it is placed.
   fileprivate func tapEnded(at p: CGPoint) {
+    if adjustGrab >= 0 {
+      adjustGrab = -1
+      overlay.setNeedsDisplay()
+      return
+    }
     if tapPreview == nil { return }
     tapPreview = nil
     defer { overlay.setNeedsDisplay() }
@@ -2325,12 +2482,22 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   }
 
   fileprivate func tapCancelled() {
+    adjustGrab = -1
     tapPreview = nil
     overlay.setNeedsDisplay()
   }
 
   @objc private func onUndo() {
     if completing { cancelAutoComplete("undo tapped") }
+    if adjusted != nil {
+      // First undo drops the hand adjustment: the frame follows the
+      // detections again.
+      adjusted = nil
+      adjustGrab = -1
+      flash("Back to automatic")
+      overlay.setNeedsDisplay()
+      return
+    }
     guard let last = history.popLast() else { return }
     switch last {
     case Self.hCorner: corners.removeLast()
@@ -2755,14 +2922,14 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       markButton.accessibilityLabel = openingAuto ? "Add \(mode == .door ? "door" : "window")" : "Mark point"
     }
     // Door / Window found automatically and stable: the disc turns teal.
-    let detected = openingAuto && autoOpening?.stable == true
+    let detected = openingAuto && (autoOpening?.stable == true || adjusted != nil)
     let disc = detected ? Self.snap : UIColor.white
     if markGlyph.backgroundColor != disc {
       markGlyph.backgroundColor = disc
       markGlyph.textColor = detected ? .white : Self.ink
     }
-    if tapView.isUserInteractionEnabled != tapEnabled {
-      tapView.isUserInteractionEnabled = tapEnabled
+    if tapView.isUserInteractionEnabled != touchEnabled {
+      tapView.isUserInteractionEnabled = touchEnabled
       // A finger still down when the mode or method changes places nothing.
       if !tapEnabled {
         tapPreview = nil
@@ -2773,7 +2940,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     if methodControl.selectedSegmentIndex != lineMethod.rawValue {
       methodControl.selectedSegmentIndex = lineMethod.rawValue
     }
-    setEnabled(undoColumn, undoButton, !history.isEmpty)
+    setEnabled(undoColumn, undoButton, !history.isEmpty || adjusted != nil)
     setEnabled(doneColumn, doneButton,
                // A measured line or door / window can be finished with on
                // its own, without a room outline.
@@ -3701,19 +3868,24 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     }
     // Auto: the door or window found, amber dashed until the detections
     // agree, then green.
-    if autoOpenings, snap.tracking, let found = autoOpening {
-      let color = found.stable ? Self.snap : Self.door
+    // Adjusted by hand: solid orange, the part being dragged in blue.
+    if autoOpenings, snap.tracking, let found = shownOpening {
+      let hand = adjusted != nil
+      let color = hand ? Self.door : (found.stable ? Self.snap : Self.door)
       let p = found.a, q = found.b
       let pt = p.withY(found.top), qt = q.withY(found.top)
       let dash: [CGFloat]? = found.stable ? nil : [8, 7]
-      line(p, q, color, width: 2.5, dash: dash)
-      line(p, pt, color, width: 2.5, dash: dash)
-      line(q, qt, color, width: 2.5, dash: dash)
-      line(pt, qt, color, width: 2.5, dash: dash)
-      for c in [p, q, pt, qt] {
+      let corners = [p, q, qt, pt]
+      let g = adjustGrab
+      for i in 0..<4 {
+        let held = hand && g >= 0 && (g == 4 + i || g == i || g == (i + 1) % 4)
+        line(corners[i], corners[(i + 1) % 4], held ? Self.accent : color, width: 2.5, dash: dash)
+      }
+      for (i, c) in corners.enumerated() {
         guard let s = project(vp, c, size) else { continue }
-        fillCircle(ctx, s, 6, .white)
-        fillCircle(ctx, s, 4, color)
+        let r: CGFloat = hand ? 9 : 6
+        fillCircle(ctx, s, r, .white)
+        fillCircle(ctx, s, r - 2, hand && g == i ? Self.accent : color)
       }
       var text = String(format: "%.2f × %.2f m", p.dist2d(q), found.top - found.bottom)
       if mode == .window, let fy { text += " · sill \(m(found.bottom - fy))" }

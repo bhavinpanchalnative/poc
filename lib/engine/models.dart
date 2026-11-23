@@ -1,5 +1,13 @@
 import 'geometry.dart';
 
+/// Nothing gets an automatic name ("Room 3", "Door 1"): the user must type a
+/// name for every measurement (see `askNames` in ui/common.dart).
+/// Whether [name] still has to be typed.
+bool isUnnamed(String name) => name.trim().isEmpty;
+
+/// What a name box says while it is empty: a name is mandatory.
+const nameNeeded = 'Enter a name';
+
 /// Where a scan came from.
 enum CaptureSource { arTap, roomPlan, manual, sample, photo }
 
@@ -352,11 +360,17 @@ class MeasuredLine {
 
   final DateTime? measuredAt;
 
-  MeasuredLine copyWith({String? name, List<Vec2>? footprint}) => MeasuredLine(
+  MeasuredLine copyWith(
+          {String? name,
+          List<Vec2>? footprint,
+          double? length,
+          double? run,
+          double? rise}) =>
+      MeasuredLine(
         name: name ?? this.name,
-        length: length,
-        run: run,
-        rise: rise,
+        length: length ?? this.length,
+        run: run ?? this.run,
+        rise: rise ?? this.rise,
         footprint: footprint ?? this.footprint,
         measuredAt: measuredAt,
         estimated: estimated,

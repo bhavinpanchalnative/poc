@@ -1,10 +1,15 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../engine/models.dart';
 import '../engine/units.dart';
 import '../services/app_settings.dart';
 
-/// Asks for a line of text. Returns null when cancelled.
+/// Asks for a name. Returns null when cancelled.
+///
+/// A name is mandatory: the box is never filled in for the user (it starts
+/// with [initial], empty for something new) and Save stays off until a
+/// name is typed.
 Future<String?> askText(
   BuildContext context, {
   required String title,
@@ -13,25 +18,93 @@ Future<String?> askText(
   String confirm = 'Save',
 }) {
   final c = TextEditingController(text: initial);
+  var touched = false;
   return showDialog<String>(
     context: context,
-    builder: (ctx) => AlertDialog(
-      title: Text(title),
-      content: TextField(
-        controller: c,
-        autofocus: true,
-        textCapitalization: TextCapitalization.sentences,
-        decoration: InputDecoration(labelText: label),
-        onSubmitted: (v) => Navigator.pop(ctx, v),
-      ),
-      actions: [
-        TextButton(
-            onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-        FilledButton(
-            onPressed: () => Navigator.pop(ctx, c.text), child: Text(confirm)),
-      ],
+    builder: (ctx) => StatefulBuilder(builder: (ctx, setState) {
+      final empty = c.text.trim().isEmpty;
+      return AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: c,
+          autofocus: true,
+          textCapitalization: TextCapitalization.sentences,
+          decoration: InputDecoration(
+            labelText: label,
+            errorText: empty && touched ? nameNeeded : null,
+          ),
+          onChanged: (_) => setState(() => touched = true),
+          onSubmitted: (v) {
+            if (v.trim().isNotEmpty) Navigator.pop(ctx, v.trim());
+          },
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+              onPressed: empty ? null : () => Navigator.pop(ctx, c.text.trim()),
+              child: Text(confirm)),
+        ],
+      );
+    }),
+  );
+}
+
+/// Asks for the name of each new measurement, one box per item ([labels]
+/// say what each one is, e.g. "Window · 1.20 × 1.10 m"). Every name is
+/// mandatory: Save stays off until all are typed, and the dialog cannot be
+/// closed without them. Returns the names in the order of [labels].
+Future<List<String>> askNames(
+  BuildContext context, {
+  required String title,
+  required List<String> labels,
+  String confirm = 'Save',
+}) async {
+  final cs = [for (final _ in labels) TextEditingController()];
+  final touched = List.filled(labels.length, false);
+  final result = await showDialog<List<String>>(
+    context: context,
+    barrierDismissible: false,
+    builder: (ctx) => PopScope(
+      canPop: false,
+      child: StatefulBuilder(builder: (ctx, setState) {
+        final ready = cs.every((c) => c.text.trim().isNotEmpty);
+        void save() {
+          if (cs.every((c) => c.text.trim().isNotEmpty)) {
+            Navigator.pop(ctx, [for (final c in cs) c.text.trim()]);
+          }
+        }
+
+        return AlertDialog(
+          title: Text(title),
+          scrollable: true,
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            for (var i = 0; i < labels.length; i++)
+              Padding(
+                padding: EdgeInsets.only(top: i == 0 ? 0 : 12),
+                child: TextField(
+                  controller: cs[i],
+                  autofocus: i == 0,
+                  textCapitalization: TextCapitalization.sentences,
+                  textInputAction:
+                      i == labels.length - 1 ? TextInputAction.done : TextInputAction.next,
+                  decoration: InputDecoration(
+                    labelText: labels[i],
+                    errorText: touched[i] && cs[i].text.trim().isEmpty ? nameNeeded : null,
+                  ),
+                  onChanged: (_) => setState(() => touched[i] = true),
+                  onSubmitted: (_) => i == labels.length - 1 ? save() : null,
+                ),
+              ),
+          ]),
+          actions: [
+            FilledButton(onPressed: ready ? save : null, child: Text(confirm)),
+          ],
+        );
+      }),
     ),
   );
+  return result ?? [for (final c in cs) c.text.trim()];
 }
 
 /// A text field for a length in [unit] that validates as you type.

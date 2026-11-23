@@ -119,6 +119,21 @@ internal class RectifiedImage(
     operator fun get(c: Int, r: Int) = pixels[r * width + c]
 }
 
+/**
+ * A wall placed by [OpeningDetector.wallFromFloorLine]: [moved] is how far
+ * the crosshair's point moved (m, negative: towards the camera), [turned]
+ * how much the wall turned (degrees), [strips] how many 10 cm strips
+ * showed the floor line.
+ */
+internal class FloorLineWall(val frame: WallFrame, val moved: Float, val turned: Float, val strips: Int)
+
+/** The result of [OpeningDetector.measure]: the wall used (corrected by the
+ *  floor line when [floorLine] is set), the image rectified on it and the
+ *  detection. */
+internal class Measured(
+    val frame: WallFrame, val image: RectifiedImage, val detection: OpeningDetection, val floorLine: FloorLineWall?,
+)
+
 /** A detection with the edge profiles it was made from (for diagnostics). */
 internal class OpeningDetection(
     val candidate: OpeningCandidate?,
@@ -132,7 +147,9 @@ internal object OpeningDetector {
     /** Rectified cell size (m). */
     const val CELL = 0.01f
     private const val U_HALF = 1.6f
-    private const val BELOW_BASE = 0.10f
+    /** Below the floor too: when the wall is assumed too far away, the line
+     *  where it meets the floor shows up below the floor's height. */
+    private const val BELOW_BASE = 0.35f
     private const val ABOVE_BASE = 2.80f
 
     /** A peak must be this many times the median of its search range... */
@@ -145,6 +162,10 @@ internal object OpeningDetector {
     private const val CASING = 0.15f
     /** The sides are looked for at least this far from the crosshair. */
     private const val SIDE_GAP = 0.12f
+    /** A casing's inside edge is at least this share of its strongest edge. */
+    private const val CASING_SHARE = 0.45f
+    /** A farther edge replacing a window bar is at least this share of its score. */
+    private const val BAR_STEP_SHARE = 0.5f
 
     /**
      * Samples the camera image ([lum], described by [camera]) on the wall
@@ -186,11 +207,35 @@ internal object OpeningDetector {
     fun detect(kind: OpeningKind, frame: WallFrame, image: RectifiedImage): OpeningCandidate? =
         analyze(kind, frame, image).candidate
 
+    /**
+     * One automatic attempt: rectifies the camera image on [frame] and looks
+     * for the door / window; then places the wall by the line where it meets
+     * the floor ([wallFromFloorLine]) and, if that moved it, looks again on
+     * the corrected wall. A wall that was only guessed ([WallFrame.estimated])
+     * may move up to 1.5 m and turn up to 30 degrees, and is then measured;
+     * a detected wall surface only up to 8 cm and 8 degrees, so that a
+     * misread line can never make it worse by more than its own error.
+     */
+    fun measure(kind: OpeningKind, frame: WallFrame, camera: CameraModel, lum: Luminance): Measured {
+        val img = rectify(frame, camera, lum)
+        val det = analyze(kind, frame, img)
+        val c = det.candidate
+        val fl = wallFromFloorLine(frame, camera, img, c?.left ?: Float.NaN, c?.right ?: Float.NaN)
+        val ok = fl != null && if (frame.estimated) abs(fl.moved) <= 1.5f && fl.turned <= 30f
+        else abs(fl.moved) <= 0.08f && fl.turned <= 8f
+        if (fl == null || !ok || (abs(fl.moved) < 0.003f && fl.turned < 0.3f && !frame.estimated)) {
+            return Measured(frame, img, det, null)
+        }
+        val img2 = rectify(fl.frame, camera, lum)
+        return Measured(fl.frame, img2, analyze(kind, fl.frame, img2), fl)
+    }
+
     private class Peak(val pos: Float, val value: Float, val prominence: Float)
 
     /** One edge or a group of parallel ones (casing): [pos] is the member
-     *  nearest the crosshair, [score] the strongest member's prominence. */
-    private class Edge(val pos: Float, val prominence: Float, val score: Float)
+     *  nearest the crosshair, [outer] the one farthest from it, [score] the
+     *  strongest member's prominence. */
+    private class Edge(val pos: Float, val prominence: Float, val score: Float, val outer: Float = pos)
 
     fun analyze(kind: OpeningKind, frame: WallFrame, img: RectifiedImage): OpeningDetection {
         val w = img.width
@@ -241,17 +286,16 @@ internal object OpeningDetector {
         val body = if (door) rowsFor(base + 0.3f, base + 1.8f) else rowsFor(o.y - 0.3f, o.y + 0.5f)
         val colProfile = FloatArray(w)
         val minRows = max(10, (body.last - body.first + 1) / 5)
+        val scratch = FloatArray(max(w, h))
         for (c in 0 until w) {
-            var sum = 0f
             var cnt = 0
             for (r in body) {
                 val i = r * w + c
                 if (!valid[i]) continue
-                cnt++
                 val ax = abs(gx[i])
-                if (ax > 2 * abs(gy[i])) sum += ax
+                scratch[cnt++] = if (ax > 2 * abs(gy[i])) ax else 0f
             }
-            colProfile[c] = if (cnt >= minRows) sum / cnt else 0f
+            colProfile[c] = if (cnt >= minRows) cappedMean(scratch, cnt) else 0f
         }
         val rowProfile = FloatArray(h)
         fun fail() = OpeningDetection(null, colProfile, rowProfile)
@@ -273,23 +317,79 @@ internal object OpeningDetector {
                 bestR = rt
             }
         }
-        val left = bestL ?: return fail()
-        val right = bestR ?: return fail()
+        var left = bestL ?: return fail()
+        var right = bestR ?: return fail()
+
+        // Mean brightness of the cells within u [uA, uB], v [vA, vB] (either order).
+        fun band(uA: Float, uB: Float, vA: Float, vB: Float): Float {
+            val cs = colsFor(min(uA, uB), max(uA, uB))
+            val rs = rowsFor(min(vA, vB), max(vA, vB))
+            var s = 0f
+            var cnt = 0
+            for (r in rs) for (c in cs) {
+                val x = p[r * w + c]
+                if (x.isNaN()) continue
+                s += x
+                cnt++
+            }
+            return if (cnt > 0) s / cnt else Float.NaN
+        }
+
+        /**
+         * Whether the edge group from [inner] to [outer] (along one axis,
+         * outward = sign of outer - inner) is a bar inside a window (a
+         * mullion or transom: glass on both sides of it) rather than the
+         * frame (wall beyond it). [at] gives the band's mean brightness for an
+         * interval of that axis.
+         */
+        fun isBar(inner: Float, outer: Float, at: (Float, Float) -> Float): Boolean {
+            val span = outer - inner
+            if (abs(span) < 0.02f) return false
+            val dir = if (span > 0f) 1f else -1f
+            val inside = at(inner - dir * 0.10f, inner - dir * 0.03f)
+            val bar = at(inner + dir * 0.01f, outer - dir * 0.01f)
+            val beyond = at(outer + dir * 0.03f, outer + dir * 0.10f)
+            if (inside.isNaN() || bar.isNaN() || beyond.isNaN()) return false
+            val contrast = abs(bar - inside)
+            return contrast >= 8f && abs(beyond - inside) < 0.35f * contrast
+        }
+
+        /** Windows: the nearest strong edge beyond a bar, else [e]. */
+        fun pastBars(e: Edge, candidates: List<Edge>, at: (Float, Float) -> Float, ok: (Edge) -> Boolean): Edge {
+            var cur = e
+            repeat(3) {
+                if (!isBar(cur.pos, cur.outer, at)) return cur
+                val dir = if (cur.outer > cur.pos) 1f else -1f
+                val next = candidates
+                    .filter { (it.pos - cur.outer) * dir > 0.02f && it.score >= BAR_STEP_SHARE * cur.score && ok(it) }
+                    .minByOrNull { abs(it.pos - cur.outer) } ?: return cur
+                cur = next
+            }
+            return cur
+        }
+
+        if (!door) {
+            val bodyLo = img.v(body.last.toFloat())
+            val bodyHi = img.v(body.first.toFloat())
+            val colBand = { a: Float, b: Float -> band(a, b, bodyLo, bodyHi) }
+            val r0 = right
+            left = pastBars(left, lefts, colBand) { r0.pos - it.pos <= maxW }
+            val l0 = left
+            right = pastBars(right, rights, colBand) { it.pos - l0.pos <= maxW }
+        }
 
         // Horizontal edges, row by row, between the sides.
         val inner = colsFor(left.pos + 0.03f, right.pos - 0.03f)
         val minCols = max(5, (inner.last - inner.first + 1) / 5)
         for (r in 0 until h) {
-            var sum = 0f
             var cnt = 0
             for (c in inner) {
                 val i = r * w + c
                 if (!valid[i]) continue
-                cnt++
                 val ay = abs(gy[i])
-                if (ay > 2 * abs(gx[i])) sum += ay
+                scratch[cnt++] = if (ay > 2 * abs(gx[i])) ay else 0f
             }
-            rowProfile[r] = if (cnt >= minCols) sum / cnt else 0f
+            rowProfile[r] = if (cnt >= minCols) cappedMean(scratch, cnt) else 0f
         }
 
         // Top: the edge nearest the crosshair of the strongest group.
@@ -298,7 +398,10 @@ internal object OpeningDetector {
             frame.floorY != null -> rowsFor(frame.floorY + 1.8f, frame.floorY + 2.6f)
             else -> rowsFor(o.y + 0.6f, o.y + 1.5f)
         }
-        val top = edges(peaks(rowProfile, topRange, img::v), o.y).maxByOrNull { it.score } ?: return fail()
+        val tops = edges(peaks(rowProfile, topRange, img::v), o.y)
+        val rowBand = { a: Float, b: Float -> band(left.pos + 0.03f, right.pos - 0.03f, a, b) }
+        val top = tops.maxByOrNull { it.score }?.let { if (door) it else pastBars(it, tops, rowBand) { true } }
+            ?: return fail()
 
         // Bottom.
         var bottomEstimated = false
@@ -310,7 +413,7 @@ internal object OpeningDetector {
                 bottom = fy
             } else {
                 // The floor line under the door, near where the floor is assumed.
-                val pk = peaks(rowProfile, rowsFor(img.v0, base + 0.4f), img::v).maxByOrNull { it.prominence }
+                val pk = peaks(rowProfile, rowsFor(base - 0.10f, base + 0.4f), img::v).maxByOrNull { it.prominence }
                 if (pk != null) {
                     bottom = pk.pos
                     bottomProm = pk.prominence
@@ -323,7 +426,8 @@ internal object OpeningDetector {
             val lo = frame.floorY?.let { max(o.y - 1.6f, it + 0.05f) } ?: (o.y - 1.6f)
             val hi = o.y - 0.1f
             if (hi <= lo) return fail()
-            val e = edges(peaks(rowProfile, rowsFor(lo, hi), img::v), o.y).maxByOrNull { it.score } ?: return fail()
+            val sills = edges(peaks(rowProfile, rowsFor(lo, hi), img::v), o.y)
+            val e = sills.maxByOrNull { it.score }?.let { pastBars(it, sills, rowBand) { true } } ?: return fail()
             bottom = e.pos
             bottomProm = e.prominence
         }
@@ -342,6 +446,21 @@ internal object OpeningDetector {
             frame.estimated || bottomEstimated,
         )
         return OpeningDetection(cand, colProfile, rowProfile)
+    }
+
+    /**
+     * Mean of the first [n] values of [v] (reordered), each capped at their
+     * 75th percentile: an edge counts by how strong it is along most of its
+     * length, so a short bright feature (a door handle, a light switch)
+     * next to a frame does not outweigh the frame's own edge.
+     */
+    private fun cappedMean(v: FloatArray, n: Int): Float {
+        if (n == 0) return 0f
+        java.util.Arrays.sort(v, 0, n)
+        val cap = v[min(n - 1, (n * 3) / 4)]
+        var s = 0f
+        for (i in 0 until n) s += min(v[i], cap)
+        return s / n
     }
 
     /**
@@ -383,10 +502,176 @@ internal object OpeningDetector {
             val strongest = left[0]
             val members = left.filter { abs(it.pos - strongest.pos) <= CASING }
             left.removeAll(members)
-            val rep = members.minByOrNull { abs(it.pos - ref) } ?: strongest
-            out.add(Edge(rep.pos, rep.prominence, strongest.prominence))
+            // Only edges about as strong as the casing's own count as its
+            // inside edge: a door handle or the moulding of a panel a few cm
+            // inside the frame is weaker and would make the door too small.
+            val strong = members.filter { it.value >= CASING_SHARE * strongest.value }
+            val rep = strong.minByOrNull { abs(it.pos - ref) } ?: strongest
+            val outer = strong.maxByOrNull { abs(it.pos - ref) } ?: strongest
+            out.add(Edge(rep.pos, rep.prominence, strongest.prominence, outer.pos))
         }
         return out
+    }
+
+    /**
+     * The wall where it really is, from the line along which it meets the
+     * floor (its base or skirting), or null when that line is not seen
+     * clearly.
+     *
+     * Door and window sizes are measured on the wall plane, so a wall
+     * assumed d cm too near or too far makes them d / distance too small or
+     * too large, and a guessed wall (no surface detected) can be off by tens
+     * of cm. The floor, though, is known accurately. Each 10 cm strip of
+     * [img] (rectified on [frame]) is searched for horizontal edges near the
+     * floor's height; the camera ray through each edge meets the floor where
+     * that edge really is. Those floor points line up along the wall's base:
+     * a line through them gives the wall's true position and direction.
+     * Strips over the opening ([skipLo]..[skipHi], wall u) are left out: an
+     * open door shows the next room's floor.
+     *
+     * Of the lines found, the best supported is used, unless one about as
+     * well supported lies 4-30 cm nearer the camera: a skirting's top edge
+     * seen as a floor line lands behind the wall, and the floor line in
+     * front of it is the wall's base.
+     */
+    fun wallFromFloorLine(
+        frame: WallFrame, camera: CameraModel, img: RectifiedImage,
+        skipLo: Float = Float.NaN, skipHi: Float = Float.NaN,
+    ): FloorLineWall? {
+        val fy = frame.floorY ?: return null
+        val m = camera.worldToCamera
+        val t0 = m[12]
+        val t1 = m[13]
+        val t2 = m[14]
+        val cam = Vec3(
+            -(m[0] * t0 + m[1] * t1 + m[2] * t2),
+            -(m[4] * t0 + m[5] * t1 + m[6] * t2),
+            -(m[8] * t0 + m[9] * t1 + m[10] * t2),
+        )
+        if (cam.y - fy < 0.4f) return null
+        val w = img.width
+        val h = img.height
+        val p = img.pixels
+        val r0 = ceil(img.row(fy + 0.45f)).toInt().coerceIn(1, h - 2)
+        val r1 = floor(img.row(fy - 0.30f)).toInt().coerceIn(1, h - 2)
+        if (r1 - r0 < 6) return null
+
+        class Sample(val x: Float, val z: Float, val weight: Float, val strip: Int, val u: Float)
+        val samples = ArrayList<Sample>()
+        val strip = 10
+        val profile = FloatArray(h)
+        var s = 0
+        var c0 = 1
+        while (c0 + strip < w - 1) {
+            val uMid = img.u(c0 + strip / 2f)
+            val skip = !skipLo.isNaN() && uMid > skipLo - 0.10f && uMid < skipHi + 0.10f
+            if (!skip) {
+                profile.fill(0f)
+                for (r in r0..r1) {
+                    var sum = 0f
+                    var n = 0
+                    for (c in c0 until c0 + strip) {
+                        val i = r * w + c
+                        val a = p[i - w - 1]; val b = p[i - w]; val cc = p[i - w + 1]
+                        val d = p[i - 1]; val f = p[i + 1]
+                        val g = p[i + w - 1]; val hh = p[i + w]; val k = p[i + w + 1]
+                        val gx = ((cc + 2 * f + k) - (a + 2 * d + g)) / 8f
+                        val gy = ((g + 2 * hh + k) - (a + 2 * b + cc)) / 8f
+                        if (gx.isNaN() || gy.isNaN()) continue
+                        n++
+                        val ay = abs(gy)
+                        if (ay > 2 * abs(gx)) sum += ay
+                    }
+                    profile[r] = if (n >= strip / 2) sum / n else 0f
+                }
+                for (pk in peaks(profile, r0..r1, img::v).sortedByDescending { it.value }.take(3)) {
+                    val q = frame.world(uMid, pk.pos)
+                    val dir = q - cam
+                    if (dir.y > -1e-3f) continue
+                    val t = (fy - cam.y) / dir.y
+                    val x = cam.x + dir.x * t
+                    val z = cam.z + dir.z * t
+                    val dist = sqrt((x - cam.x) * (x - cam.x) + (z - cam.z) * (z - cam.z))
+                    if (dist < 0.3f || dist > 10f) continue
+                    samples.add(Sample(x, z, pk.value, s, uMid))
+                }
+            }
+            c0 += strip
+            s++
+        }
+        if (samples.size < 4) return null
+
+        class Line(val px: Float, val pz: Float, val nx: Float, val nz: Float, val support: Float, val inliers: List<Sample>)
+        // Every pair of samples from strips at least 30 cm apart proposes a
+        // line; its support is the summed strength of the strips with a
+        // sample within 3 cm of it (each strip's nearest one).
+        val lines = ArrayList<Line>()
+        val maxTilt = 0.42f // sin(25 degrees): roughly along the assumed wall
+        for (i in samples.indices) for (j in i + 1 until samples.size) {
+            val a = samples[i]
+            val b = samples[j]
+            if (abs(a.u - b.u) < 0.3f) continue
+            val l = sqrt((b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z))
+            if (l < 0.2f) continue
+            val dx = (b.x - a.x) / l
+            val dz = (b.z - a.z) / l
+            if (abs(dx * frame.normal.x + dz * frame.normal.z) > maxTilt) continue
+            val nx = -dz
+            val nz = dx
+            val best = HashMap<Int, Sample>()
+            for (q in samples) {
+                val e = abs((q.x - a.x) * nx + (q.z - a.z) * nz)
+                if (e > 0.03f) continue
+                val cur = best[q.strip]
+                if (cur == null || q.weight > cur.weight) best[q.strip] = q
+            }
+            if (best.size < 4) continue
+            val inl = best.values.toList()
+            if (inl.maxOf { it.u } - inl.minOf { it.u } < 0.5f) continue
+            lines.add(Line(a.x, a.z, nx, nz, inl.sumOf { it.weight.toDouble() }.toFloat(), inl))
+        }
+        val top = lines.maxByOrNull { it.support } ?: return null
+        // Distance of a line from the camera along the assumed wall's normal.
+        fun depth(l: Line) = abs((l.px - cam.x) * l.nx + (l.pz - cam.z) * l.nz)
+        val chosen = lines
+            .filter { it.support >= 0.6f * top.support && abs(it.nx * top.nx + it.nz * top.nz) > 0.996f }
+            .filter { depth(top) - depth(it) in 0.04f..0.30f }
+            .maxByOrNull { it.support } ?: top
+
+        // Least-squares line through the chosen inliers.
+        val inl = chosen.inliers
+        val mx = inl.sumOf { it.x.toDouble() }.toFloat() / inl.size
+        val mz = inl.sumOf { it.z.toDouble() }.toFloat() / inl.size
+        var sxx = 0f
+        var sxz = 0f
+        var szz = 0f
+        for (q in inl) {
+            val dx = q.x - mx
+            val dz = q.z - mz
+            sxx += dx * dx
+            sxz += dx * dz
+            szz += dz * dz
+        }
+        val ang = 0.5f * kotlin.math.atan2(2f * sxz, sxx - szz)
+        var nx = -kotlin.math.sin(ang)
+        var nz = kotlin.math.cos(ang)
+        // Facing the camera.
+        if ((cam.x - mx) * nx + (cam.z - mz) * nz < 0f) {
+            nx = -nx
+            nz = -nz
+        }
+        // The crosshair's point: where its ray (camera to the old origin)
+        // meets the new wall.
+        val o = frame.origin
+        val ray = o - cam
+        val den = ray.x * nx + ray.z * nz
+        if (abs(den) < 1e-3f) return null
+        val k = ((mx - cam.x) * nx + (mz - cam.z) * nz) / den
+        if (k <= 0f) return null
+        val origin = cam + ray * k
+        val moved = (origin - o).let { sqrt(it.x * it.x + it.z * it.z) }
+        val turned = Math.toDegrees(kotlin.math.acos((nx * frame.normal.x + nz * frame.normal.z).coerceIn(-1f, 1f).toDouble())).toFloat()
+        return FloorLineWall(WallFrame(origin, Vec3(nx, 0f, nz), fy, false), moved * if (k < 1f) -1f else 1f, turned, inl.size)
     }
 
     /** [img] as an 8-bit grayscale PNG (NaN as black), for diagnostics. */

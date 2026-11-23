@@ -255,6 +255,9 @@ do {
   // Opening sizes (changed for the off-grid series below).
   var doorW: Float = 0.82, doorH: Float = 2.03
   var winW: Float = 1.20, winH: Float = 1.10, winSill: Float = 0.90
+  // Real-world details: a door leaf with a handle and recessed panels, a
+  // window split by a mullion and a transom (bars as strong as the frame).
+  var doorDetails = false, windowBars = false
 
   enum Scene { case door, openDoor, window, plain }
 
@@ -272,6 +275,15 @@ do {
     case .door, .openDoor:
       let dx = abs(p.x - doorX)
       if dx <= doorW / 2 && p.y <= doorH {
+        if scene == .door && doorDetails {
+          let u = p.x - doorX
+          // Handle 6-12 cm in from the right side, panels inset 12 cm.
+          if u >= doorW / 2 - 0.12 && u <= doorW / 2 - 0.06 && p.y >= 0.95 && p.y <= 1.10 { return 230 }
+          let mid = doorH / 2 + 0.1
+          if abs(u) < doorW / 2 - 0.12 && ((p.y > 0.15 && p.y < mid - 0.06) || (p.y > mid + 0.06 && p.y < doorH - 0.12)) {
+            return 75
+          }
+        }
         if scene == .door { return 90 }
         // Through the opening: a wall 2 m farther, or the floor before it.
         let tFar = (-2.0 - o.z) / d.z
@@ -281,7 +293,10 @@ do {
       return 180
     case .window:
       let dx = abs(p.x - winX)
-      if dx <= winW / 2 && p.y >= winSill && p.y <= winSill + winH { return 60 }
+      if dx <= winW / 2 && p.y >= winSill && p.y <= winSill + winH {
+        if windowBars && (dx < 0.03 || abs(p.y - (winSill + winH - 0.35)) < 0.03) { return 220 }
+        return 60
+      }
       if dx <= winW / 2 + 0.08 && p.y >= winSill - 0.08 && p.y <= winSill + winH + 0.08 { return 220 }
       return 180
     }
@@ -290,6 +305,10 @@ do {
   var noise = Rng(s: 7)
   /// Renders the scene and runs the detector. The crosshair aims at
   /// (aimX, height given by the pitch) on the wall.
+  // The wall as the scanner assumes it: this far nearer the camera (m),
+  // turned by this much (degrees), and whether it was only guessed.
+  var wallErr: Float = 0, wallTurn: Float = 0, wallGuessed = false
+
   func run(_ scene: Scene, _ kind: OpeningKind, dist: Float, yaw yawDeg: Float, pitch pitchDeg: Float,
            aimX: Float, floorKnown: Bool = true) -> (OpeningCandidate?, OpeningAnalysis) {
     let yaw = yawDeg * .pi / 180, pitch = pitchDeg * .pi / 180
@@ -313,16 +332,17 @@ do {
     }
     let model = CameraModel(worldToCamera: camToWorld.inverse, fx: fx, fy: fy, cx: icx, cy: icy,
                             width: imgW, height: imgH)
-    let frame = WallFrame(origin: aim, normal: V3(0, 0, 1), floorY: floorKnown ? 0 : nil, estimated: false)
-    let rect = OpeningDetector.rectify(frame: frame, camera: model) { sx, sy in
+    let turn = wallTurn * .pi / 180
+    let frame = WallFrame(origin: aim + V3(0, 0, wallErr), normal: V3(sin(turn), 0, cos(turn)),
+                          floorY: floorKnown ? 0 : nil, estimated: wallGuessed)
+    let res = OpeningDetector.measure(kind: kind, frame: frame, camera: model) { sx, sy in
       if sx < 0 || sy < 0 || sx > Float(imgW - 1) || sy > Float(imgH - 1) { return nil }
       let x0 = min(Int(sx), imgW - 2), y0 = min(Int(sy), imgH - 2)
       let ax = sx - Float(x0), ay = sy - Float(y0)
       let i = y0 * imgW + x0
       return (img[i] * (1 - ax) + img[i + 1] * ax) * (1 - ay) + (img[i + imgW] * (1 - ax) + img[i + imgW + 1] * ax) * ay
     }
-    let res = OpeningDetector.analyze(kind: kind, frame: frame, image: rect)
-    return (res.candidate, res)
+    return (res.analysis.candidate, res.analysis)
   }
 
   /// Runs a set of views; returns the number of misses and the worst error.
@@ -385,6 +405,42 @@ do {
   series("window 1.203 x 1.096 m, sill 0.904 m (off the grid)", .window, .window, aimX: winX + 0.0371,
          views: [(2.0, 0, 0), (2.4, 12, -5), (2.8, -25, 5), (2.2, 18, 3), (2.6, -7, -4)],
          width: 1.203, height: 1.096, sill: 0.904)
+
+  // A handle or panel moulding next to the frame was taken for its inside
+  // edge (door 12-24 cm too small); a mullion or transom for the frame
+  // (window cut in half or to the transom).
+  doorW = 0.82; doorH = 2.03
+  winW = 1.20; winH = 1.10; winSill = 0.90
+  doorDetails = true
+  series("door with handle and panels", .door, .door, aimX: doorX + 0.0537,
+         views: [(2.0, 0, -10), (2.4, 12, 0), (2.8, -25, 10), (2.2, 10, -5)],
+         width: 0.82, height: 2.03, sill: nil)
+  series("door with handle and panels, aimed off-centre", .door, .door, aimX: doorX - 0.25,
+         views: [(2.2, 10, -5), (2.4, -12, 0)], width: 0.82, height: 2.03, sill: nil)
+  doorDetails = false
+  windowBars = true
+  series("window with mullion and transom", .window, .window, aimX: winX + 0.0813,
+         views: [(2.0, 0, 0), (2.4, 12, -5), (2.8, -25, 5), (2.3, 10, 0)],
+         width: 1.20, height: 1.10, sill: 0.90)
+  series("window with mullion and transom, aimed off-centre", .window, .window, aimX: winX - 0.2,
+         views: [(2.3, 0, 0), (2.4, 12, -5)], width: 1.20, height: 1.10, sill: 0.90)
+  windowBars = false
+
+  // The wall plane off: detected a few cm out, or only guessed (tens of cm
+  // out and turned). The line where the wall meets the floor places it.
+  wallErr = 0.05
+  series("door, wall detected 5 cm too near", .door, .door, aimX: doorX + 0.0537,
+         views: [(2.2, 10, -5), (2.6, -12, -5)], width: 0.82, height: 2.03, sill: nil)
+  wallErr = -0.05; wallTurn = 6
+  series("door, wall detected 5 cm too far and turned 6°", .door, .door, aimX: doorX + 0.0537,
+         views: [(2.2, 10, -5), (2.6, -12, -5)], width: 0.82, height: 2.03, sill: nil)
+  wallErr = 0.40; wallTurn = 15; wallGuessed = true
+  series("door, wall guessed 40 cm too near, turned 15°", .door, .door, aimX: doorX + 0.0537,
+         views: [(2.6, 15, -5), (2.4, -10, -8)], width: 0.82, height: 2.03, sill: nil)
+  wallErr = 0.30; wallTurn = 10
+  series("window, wall guessed 30 cm too near, turned 10°", .window, .window, aimX: winX + 0.0813,
+         views: [(2.8, 0, -2), (2.6, 10, -3)], width: 1.20, height: 1.10, sill: 0.90)
+  wallErr = 0; wallTurn = 0; wallGuessed = false
 
   var falseHits = 0
   for (kind, dist, yaw, pitch) in [(OpeningKind.door, Float(2.0), Float(0), Float(0)), (.door, 2.8, 20, -10),

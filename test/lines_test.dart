@@ -20,9 +20,10 @@ void main() {
   test('scanner lines are parsed and numbered', () {
     final lines = parseLines([0, 0, 0, 1.24, 0, 0, 0, 1, 0, 0, 1.56, 0], first: 3);
     expect(lines, hasLength(2));
-    expect(lines[0].name, 'Line 3');
+    // No automatic names ("Line 3"): the user names each line.
+    expect(lines[0].name, '');
     expect(lines[0].length, closeTo(1.24, 1e-9));
-    expect(lines[1].name, 'Line 4');
+    expect(lines[1].name, '');
     expect(lines[1].length, closeTo(0.56, 1e-9));
     // A horizontal line has no "up" part worth showing.
     expect(lines[0].rise, closeTo(0, 1e-9));

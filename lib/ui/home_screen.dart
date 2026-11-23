@@ -116,7 +116,8 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  String get _nextName => 'Room ${saved.length + 1}';
+  /// New rooms start without a name: the user types it (asked for once it is measured).
+  String get _nextName => '';
 
   Future<void> _open(
     RoomScan scan, {
@@ -140,11 +141,45 @@ class _HomeScreenState extends State<HomeScreen> {
     _load();
   }
 
+  String _len(double m) => formatLength(m, AppSettings.unit.value);
+
+  /// The user names what was just measured: the room, and any lines and
+  /// surfaces in it, that have no name yet. Mandatory: nothing is saved
+  /// before every name is typed.
+  Future<void> _nameScan(RoomScan scan) async {
+    final labels = <String>[];
+    final apply = <void Function(String)>[];
+    if (isUnnamed(scan.name)) {
+      labels.add('Room name');
+      apply.add((n) => scan.name = n);
+    }
+    for (var k = 0; k < scan.lines.length; k++) {
+      final l = scan.lines[k];
+      if (!isUnnamed(l.name)) continue;
+      labels.add('Line · ${_len(l.length)}');
+      apply.add((n) => scan.lines[k] = scan.lines[k].copyWith(name: n));
+    }
+    for (var k = 0; k < scan.surfaces.length; k++) {
+      final m = scan.surfaces[k];
+      if (!isUnnamed(m.name)) continue;
+      labels.add('${m.kind.label} · ${_len(m.width)} × ${_len(m.height)}');
+      apply.add((n) => scan.surfaces[k] = scan.surfaces[k].copyWith(name: n));
+    }
+    if (labels.isEmpty || !mounted) return;
+    final names = await askNames(context,
+        title: labels.length == 1 ? 'Name this room' : 'Name your measurements', labels: labels);
+    for (var i = 0; i < names.length; i++) {
+      apply[i](names[i]);
+    }
+  }
+
   Future<void> _saveAndOpen(
     RoomScan scan, {
     bool justScanned = false,
     int? openOpening,
   }) async {
+    await _nameScan(scan);
+    if (!mounted) return;
     await ScanStore.save(scan);
     if (!mounted) return;
     await _open(
@@ -210,7 +245,24 @@ class _HomeScreenState extends State<HomeScreen> {
           await (await ScanStore.photoFile(p)).delete();
         } catch (_) {}
       }
-      final loose = captured.looseOpenings;
+      // The user names each door, window and line measured (mandatory).
+      var loose = captured.looseOpenings;
+      final labels = [
+        for (final o in loose)
+          '${o.type.label} · ${_len(o.width)}${o.height == null ? '' : ' × ${_len(o.height!)}'}',
+        for (final l in lines) 'Line · ${_len(l.length)}',
+      ];
+      final names = labels.isEmpty || !mounted
+          ? const <String>[]
+          : await askNames(context,
+              title: labels.length == 1
+                  ? 'Name this ${loose.isEmpty ? 'line' : loose.first.type.label.toLowerCase()}'
+                  : 'Name your measurements',
+              labels: labels);
+      if (names.length == labels.length) {
+        loose = [for (var i = 0; i < loose.length; i++) loose[i].copyWith(name: names[i])];
+      }
+      String lineName(int i) => names.length == labels.length ? names[loose.length + i] : '';
       if (loose.isNotEmpty) {
         await OpeningStore.save([
           ...loose.reversed,
@@ -232,7 +284,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await LineStore.save([
         for (var i = lines.length - 1; i >= 0; i--)
           MeasuredLine(
-            name: 'Line ${kept.length + i + 1}',
+            name: lineName(i),
             length: lines[i].length,
             run: lines[i].run,
             rise: lines[i].rise,
@@ -495,9 +547,11 @@ class _HomeScreenState extends State<HomeScreen> {
       showMessage(context, 'Scan or enter a room first, then build a map.');
       return;
     }
+    final name = await askText(context, title: 'Name this floor map', label: 'Name', confirm: 'Create');
+    if (name == null || name.trim().isEmpty || !mounted) return;
     final m = FloorMap(
       id: RoomScan.newId(),
-      name: 'Floor ${maps.length + 1}',
+      name: name.trim(),
       createdAt: DateTime.now(),
     );
     await MapStore.save(m);

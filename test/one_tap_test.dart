@@ -20,7 +20,8 @@ void main() {
 
   test('doors and windows without a room are kept with their size', () {
     final loose = looseOpeningsFrom(marked, at);
-    expect(loose.map((o) => o.name), ['Door 1', 'Window 1', 'Door 2']);
+    // No automatic names: the user names each one when it is measured.
+    expect(loose.map((o) => o.name), ['', '', '']);
     expect(loose[0].width, closeTo(0.82, 1e-9));
     expect(loose[0].height, 2.03);
     expect(loose[1].sill, 0.9);
@@ -30,7 +31,8 @@ void main() {
     expect(loose.map((o) => o.id).toSet(), hasLength(3));
     final back = SavedOpening.fromJson(
         jsonDecode(jsonEncode(loose[1].toJson())) as Map<String, dynamic>);
-    expect(back.name, 'Window 1');
+    expect(back.name, '');
+    expect(back.type, OpeningType.window);
     expect(back.sill, 0.9);
     expect(back.estimated, isTrue);
     expect(back.measuredAt, at);

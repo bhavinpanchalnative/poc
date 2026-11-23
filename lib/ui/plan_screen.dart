@@ -64,10 +64,20 @@ class _PlanScreenState extends State<PlanScreen>
   final _viewer = TransformationController();
   double _zoom = 1;
 
-  // Corner drag in progress.
+  // Drag of a circle in progress: a corner (_dragIndex) or a line's end
+  // (_dragLine, _dragLineEnd), by pointer _dragPointer.
   int? _dragIndex;
   PlanLayout? _dragLayout;
   List<Vec2>? _dragCorners;
+  int? _dragLine;
+  int _dragLineEnd = 0;
+  MeasuredLine? _draggedLine;
+  int? _dragPointer;
+  Offset _dragFrom = Offset.zero;
+  bool _dragMoved = false;
+
+  /// The finger that just lifted moved a circle: its tap is ignored.
+  bool _suppressTap = false;
 
   LengthUnit get unit => AppSettings.unit.value;
 
@@ -116,6 +126,13 @@ class _PlanScreenState extends State<PlanScreen>
   }
 
   Future<void> _save() async {
+    // A room has no automatic name: it is named before it is saved.
+    if (isUnnamed(scan.name)) {
+      final v = await askText(context,
+          title: 'Name this room', label: 'Room name', confirm: 'Save room');
+      if (v == null || v.trim().isEmpty || !mounted) return;
+      scan.name = v.trim();
+    }
     if (scan.source == CaptureSource.sample) {
       // Save examples as a copy, so the example itself stays unchanged.
       scan = RoomScan.fromJson({
@@ -306,7 +323,7 @@ class _PlanScreenState extends State<PlanScreen>
       builder: (_) => _SurfaceDialog(
         unit: unit,
         existing: existing,
-        defaultName: 'Surface ${scan.surfaces.length + 1}',
+        defaultName: '',
       ),
     );
     if (result == null) return;
@@ -496,43 +513,119 @@ class _PlanScreenState extends State<PlanScreen>
     }
   }
 
-  void _dragStart(FloorPlan p, PlanLayout l, Offset pos) {
-    final c = _hitCorner(p, l, pos);
-    if (c == null) return;
-    setState(() {
-      _dragIndex = c;
-      _dragLayout = l;
-      _dragCorners = List.of(p.corners);
-      selectedCorner = c;
-    });
-  }
-
-  void _dragUpdate(Offset pos) {
-    final i = _dragIndex, l = _dragLayout, cs = _dragCorners;
-    if (i == null || l == null || cs == null) return;
-    final p = l.toPlan(pos);
-    // Snap into line with the neighbouring corners to keep walls square.
-    final n = cs.length;
-    final tol = 12 / (l.scale * _zoom);
-    var x = p.x, y = p.y;
-    for (final q in [cs[(i - 1 + n) % n], cs[(i + 1) % n]]) {
-      if ((x - q.x).abs() < tol) x = q.x;
-      if ((y - q.y).abs() < tol) y = q.y;
+  /// The line end nearest [pos] within reach: (line, end).
+  (int, int)? _hitLineEnd(FloorPlan p, PlanLayout l, Offset pos) {
+    final r = 26 / _zoom;
+    (int, int)? best;
+    var bestD = r;
+    for (var k = 0; k < p.lines.length; k++) {
+      final fp = p.lines[k].footprint;
+      if (fp.length < 2) continue;
+      for (var e = 0; e < 2; e++) {
+        final d = (l.toScreen(fp[e]) - pos).distance;
+        if (d < bestD) {
+          bestD = d;
+          best = (k, e);
+        }
+      }
     }
-    setState(() => cs[i] = Vec2(x, y));
+    return best;
   }
 
-  Future<void> _dragEnd(FloorPlan p) async {
-    final i = _dragIndex, cs = _dragCorners;
+  /// A finger down on a circle (a corner or a line's end) grabs it: the
+  /// plan stops panning and zooming until it is let go. Anywhere else the
+  /// plan pans and zooms as usual.
+  void _pointerDown(FloorPlan p, PlanLayout l, PointerDownEvent e) {
+    if (_dragPointer != null) {
+      // A second finger: a pinch, not a drag. Put the circle back.
+      _cancelDrag();
+      return;
+    }
+    _suppressTap = false;
+    final pos = e.localPosition;
+    final c = _hitCorner(p, l, pos);
+    final le = c == null ? _hitLineEnd(p, l, pos) : null;
+    if (c == null && le == null) return;
     setState(() {
-      _dragIndex = null;
-      _dragLayout = null;
-      _dragCorners = null;
+      _dragPointer = e.pointer;
+      _dragFrom = pos;
+      _dragMoved = false;
+      _dragLayout = l;
+      if (c != null) {
+        _dragIndex = c;
+        _dragCorners = List.of(p.corners);
+      } else {
+        _dragLine = le!.$1;
+        _dragLineEnd = le.$2;
+        _draggedLine = p.lines[le.$1];
+      }
     });
-    if (i == null || cs == null) return;
-    PlanEditor.moveCorner(scan, p, i, cs[i]);
+  }
+
+  void _pointerMove(FloorPlan p, PointerMoveEvent e) {
+    if (e.pointer != _dragPointer) return;
+    final l = _dragLayout;
+    if (l == null) return;
+    final pos = e.localPosition;
+    if (!_dragMoved && (pos - _dragFrom).distance < 4) return;
+    _dragMoved = true;
+    final to = l.toPlan(pos);
+    final tol = 12 / (l.scale * _zoom);
+    final i = _dragIndex, cs = _dragCorners;
+    if (i != null && cs != null) {
+      // Snap into line with the neighbouring corners to keep walls square.
+      final n = cs.length;
+      var x = to.x, y = to.y;
+      for (final q in [cs[(i - 1 + n) % n], cs[(i + 1) % n]]) {
+        if ((x - q.x).abs() < tol) x = q.x;
+        if ((y - q.y).abs() < tol) y = q.y;
+      }
+      setState(() {
+        cs[i] = Vec2(x, y);
+        selectedCorner = editing ? i : selectedCorner;
+      });
+      return;
+    }
+    final k = _dragLine;
+    if (k == null) return;
+    // Snap a line's end onto a room corner.
+    var v = to;
+    for (final q in p.corners) {
+      if (q.distanceTo(to) < tol) v = q;
+    }
+    setState(() =>
+        _draggedLine = PlanEditor.movedLineEnd(p.lines[k], _dragLineEnd, v));
+  }
+
+  Future<void> _pointerUp(FloorPlan p, PointerEvent e) async {
+    if (e.pointer != _dragPointer) return;
+    final moved = _dragMoved;
+    final i = _dragIndex, cs = _dragCorners;
+    final k = _dragLine, line = _draggedLine, end = _dragLineEnd;
+    _cancelDrag();
+    // Pointer events reach this listener before the tap is decided, so a
+    // short drag that still counts as a tap is not also taken as one.
+    _suppressTap = moved;
+    if (!moved) return; // A tap: handled by onTapUp.
+    if (i != null && cs != null) {
+      PlanEditor.moveCorner(scan, p, i, cs[i]);
+    } else if (k != null && line != null) {
+      PlanEditor.moveLineEnd(scan, p, k, end, line.footprint[end]);
+    } else {
+      return;
+    }
     await _changed();
   }
+
+  void _cancelDrag() => setState(() {
+        _dragPointer = null;
+        _dragIndex = null;
+        _dragLayout = null;
+        _dragCorners = null;
+        _dragLine = null;
+        _draggedLine = null;
+        _dragMoved = false;
+      });
 
   Widget _canvas(FloorPlan p) {
     final theme = Theme.of(context);
@@ -597,40 +690,57 @@ class _PlanScreenState extends State<PlanScreen>
                 final size = Size(c.maxWidth, c.maxHeight);
                 final layout = _dragLayout ??
                     PlanLayout.fit(p, size, bottom: editing ? 56 : 0);
-                final shown = _dragCorners == null
+                final k = _dragLine, moved = _draggedLine;
+                final shown = _dragCorners == null && moved == null
                     ? p
                     : FloorPlan(
-                        corners: _dragCorners!,
+                        corners: _dragCorners ?? p.corners,
                         openings: p.openings,
                         height: p.height,
                         warnings: const [],
                         snappedWalls: 0,
                         surfaces: p.surfaces,
-                        lines: p.lines);
+                        lines: [
+                          for (var j = 0; j < p.lines.length; j++)
+                            j == k && moved != null ? moved : p.lines[j],
+                        ]);
+                final grabbing = _dragPointer != null;
                 return InteractiveViewer(
                   transformationController: _viewer,
                   minScale: 1,
                   maxScale: 8,
-                  panEnabled: !editing,
-                  scaleEnabled: !editing,
-                  child: GestureDetector(
-                    onTapUp: (d) => _onTap(p, layout, d.localPosition),
-                    onPanStart: editing
-                        ? (d) => _dragStart(p, layout, d.localPosition)
-                        : null,
-                    onPanUpdate:
-                        editing ? (d) => _dragUpdate(d.localPosition) : null,
-                    onPanEnd: editing ? (_) => _dragEnd(p) : null,
-                    child: CustomPaint(
-                      size: size,
-                      painter: PlanPainter(
-                        plan: shown,
-                        unit: unit,
-                        highlightWall: selectedWall,
-                        highlightCorner: _dragIndex ?? selectedCorner,
-                        layout: layout,
-                        editing: editing,
-                        zoom: _zoom,
+                  // Off while a circle is held, so the drag moves the circle
+                  // and not the plan.
+                  panEnabled: !grabbing,
+                  scaleEnabled: !grabbing,
+                  child: Listener(
+                    onPointerDown: (e) => _pointerDown(p, layout, e),
+                    onPointerMove: (e) => _pointerMove(p, e),
+                    onPointerUp: (e) => _pointerUp(p, e),
+                    onPointerCancel: (e) {
+                      if (e.pointer == _dragPointer) _cancelDrag();
+                    },
+                    child: GestureDetector(
+                      onTapUp: (d) {
+                        if (_suppressTap) {
+                          _suppressTap = false;
+                          return;
+                        }
+                        _onTap(p, layout, d.localPosition);
+                      },
+                      child: CustomPaint(
+                        size: size,
+                        painter: PlanPainter(
+                          plan: shown,
+                          unit: unit,
+                          highlightWall: selectedWall,
+                          highlightCorner: _dragIndex ?? selectedCorner,
+                          highlightLine: k,
+                          layout: layout,
+                          editing: editing,
+                          handles: true,
+                          zoom: _zoom,
+                        ),
                       ),
                     ),
                   ),
@@ -1433,7 +1543,7 @@ class _SurfaceDialogState extends State<_SurfaceDialog> {
   final _form = GlobalKey<FormState>();
   late SurfaceKind kind = widget.existing?.kind ?? SurfaceKind.wall;
   late final _name =
-      TextEditingController(text: widget.existing?.name ?? widget.defaultName);
+      TextEditingController(text: widget.existing?.name ?? '');
   late final _width = TextEditingController(
       text: widget.existing == null
           ? ''
@@ -1446,7 +1556,7 @@ class _SurfaceDialogState extends State<_SurfaceDialog> {
   void _submit() {
     if (!_form.currentState!.validate()) return;
     final u = widget.unit;
-    final name = _name.text.trim().isEmpty ? widget.defaultName : _name.text.trim();
+    final name = _name.text.trim();
     final w = parseLength(_width.text, u)!;
     final h = parseLength(_height.text, u)!;
     final e = widget.existing;
@@ -1472,6 +1582,9 @@ class _SurfaceDialogState extends State<_SurfaceDialog> {
             controller: _name,
             decoration: const InputDecoration(labelText: 'Name'),
             textCapitalization: TextCapitalization.sentences,
+            // Mandatory: the surface is not added without a name.
+            autovalidateMode: AutovalidateMode.onUserInteraction,
+            validator: (v) => isUnnamed(v ?? '') ? nameNeeded : null,
           ),
           const SizedBox(height: 14),
           DropdownButtonFormField<SurfaceKind>(

@@ -51,10 +51,24 @@ class MarkedOpening {
 
 /// Turns corners marked in order around a room into its walls, and places
 /// each marked door or window on the wall nearest to it.
+/// Furniture from the camera scanner's AI detector: 6 values each (centre
+/// x, z, width, depth, height, and the direction of its width), with its
+/// kind ("Sofa", "Bed"...) in [kinds].
+List<RoomElement> parseElements(List<double> raw, List<String> kinds) => [
+      for (var i = 0; i * 6 + 5 < raw.length && i < kinds.length; i++)
+        RoomElement(
+          kind: kinds[i],
+          position: Vec2(raw[i * 6], raw[i * 6 + 1]),
+          width: raw[i * 6 + 2],
+          depth: raw[i * 6 + 3],
+          height: raw[i * 6 + 4],
+          angle: raw[i * 6 + 5],
+        ),
+    ];
+
 RoomScan scanFromCorners(
   List<Vec2> corners, {
   required String name,
-  double? height,
   List<MarkedOpening> openings = const [],
   List<MeasuredSurface> surfaces = const [],
   List<MeasuredLine> lines = const [],
@@ -75,7 +89,6 @@ RoomScan scanFromCorners(
     openings: n < 3 ? [] : [for (final o in openings) placeOpening(walls, o)],
     surfaces: List.of(surfaces),
     lines: List.of(lines),
-    height: height,
   );
 }
 
@@ -175,7 +188,11 @@ class CapturedScan {
       this.estimatedWalls = 0,
       this.complete = false,
       this.focusOpening,
-      this.looseOpenings = const []});
+      this.looseOpenings = const [],
+      this.suggestedName,
+      this.floorRooms = const [],
+      this.floorOffsets = const [],
+      this.floorSuggestedNames = const []});
 
   final RoomScan scan;
 
@@ -201,6 +218,21 @@ class CapturedScan {
 
   /// Doors and windows measured without a room around them.
   final List<SavedOpening> looseOpenings;
+
+  /// A name for [scan] from what kind of room it is (LiDAR: "Kitchen"...),
+  /// offered when the user names it; null when unknown.
+  final String? suggestedName;
+
+  /// LiDAR, several rooms scanned in one go: every room (the first is
+  /// [scan]), turned together so they line up, with where each goes on a
+  /// floor map ([floorOffsets], null for a room whose plan can't be built)
+  /// and a suggested name for each. Empty for a single room.
+  final List<RoomScan> floorRooms;
+  final List<Vec2?> floorOffsets;
+  final List<String> floorSuggestedNames;
+
+  /// Several rooms were scanned together: they are saved as a floor map.
+  bool get isFloor => floorRooms.length > 1;
 }
 
 /// Doors and windows measured when no room outline was found, kept on their
@@ -256,9 +288,12 @@ class RoomScanner {
       };
 
   /// Opens the camera scanner in Line mode to measure straight-line
-  /// distances only (no room). Returns the lines measured, null when the
-  /// user backs out; throws [ScanFailure] when scanning is not possible.
-  static Future<List<MeasuredLine>?> measureLines({int first = 1}) async {
+  /// distances only (no room). Returns the lines measured and any doors /
+  /// windows measured there too (unnamed: the caller has them named and
+  /// saves them), null when the user backs out; throws [ScanFailure] when
+  /// scanning is not possible.
+  static Future<({List<MeasuredLine> lines, List<SavedOpening> openings})?>
+      measureLines({int first = 1}) async {
     Map<String, dynamic>? result;
     try {
       result = await _channel.invokeMapMethod<String, dynamic>(
@@ -275,20 +310,22 @@ class RoomScanner {
         await File(p).delete();
       } catch (_) {}
     }
-    // Doors / windows measured here too are kept on their own.
+    // Doors / windows measured here too are kept on their own, once named.
     final details = (result['openingDetails'] as List?)?.cast<double>();
-    if (details != null && details.isNotEmpty) {
-      final loose = looseOpeningsFrom(
-          parseOpeningDetails(details, (result['floorY'] as num?)?.toDouble(),
-              methods: _flags(result['openingMethods']),
-              estimated: _flags(result['openingEstimated'])),
-          DateTime.now());
-      await OpeningStore.save([...loose.reversed, ...await OpeningStore.load()]);
-    }
-    return parseLines((result['lines'] as List?)?.cast<double>() ?? const [],
-        at: DateTime.now(),
-        first: first,
-        estimated: _flags(result['linesEstimated']));
+    final loose = details == null || details.isEmpty
+        ? const <SavedOpening>[]
+        : looseOpeningsFrom(
+            parseOpeningDetails(details, (result['floorY'] as num?)?.toDouble(),
+                methods: _flags(result['openingMethods']),
+                estimated: _flags(result['openingEstimated'])),
+            DateTime.now());
+    return (
+      lines: parseLines((result['lines'] as List?)?.cast<double>() ?? const [],
+          at: DateTime.now(),
+          first: first,
+          estimated: _flags(result['linesEstimated'])),
+      openings: loose,
+    );
   }
 
   static Future<CapturedScan?> _guided(String name) async {
@@ -328,7 +365,6 @@ class RoomScanner {
         (result['surfaces'] as List?)?.cast<double>() ?? const [], floorY);
     final scan = scanFromCorners(corners,
         name: name,
-        height: (result['height'] as num?)?.toDouble(),
         openings: openings,
         surfaces: surfaces,
         lines: parseLines(
@@ -340,6 +376,13 @@ class RoomScanner {
         scan.photos.add(await ScanStore.keepPhoto(p));
         await File(p).delete();
       } catch (_) {}
+    }
+    // Furniture found by the AI detector while scanning.
+    if (scan.walls.length >= 3) {
+      scan.elements.addAll(parseElements(
+        (result['elements'] as List?)?.cast<double>() ?? const [],
+        (result['elementKinds'] as List?)?.cast<String>() ?? const [],
+      ));
     }
     final automatic = result['auto'] as bool? ?? false;
     final estimated = (result['estimated'] as num?)?.toInt() ?? 0;
@@ -359,29 +402,32 @@ class RoomScanner {
 
   static Future<CapturedScan?> _lidar(String name) async {
     final scanner = rp.RoomPlanScanner();
-    // RoomPlan only ends when Done is tapped. Watch its live updates and
-    // finish on our own once the walls close around the room and the
-    // outline has stopped changing for a few seconds.
-    final watcher = LidarCompletion();
+    // A room ends when "Room done" is tapped. Watch the live updates and end
+    // it on our own once the walls close around it, the outline has stopped
+    // changing for a few seconds and the user has turned to every wall; the
+    // scanner then offers the next room or Finish. Each room gets its own
+    // watcher.
+    var watched = -1;
+    var watcher = LidarCompletion();
     final updates = scanner.onScanResult.listen((r) {
       if (r == null) return;
       try {
+        final index = r.metadata.roomIndex ?? 0;
+        if (index != watched) {
+          watched = index;
+          watcher = LidarCompletion();
+        }
         if (watcher.update(RoomPlanMapper.toScan(r, name: name).walls,
-            DateTime.now())) {
-          scanner.stopScanning();
+            DateTime.now(),
+            sectorsSeen: r.metadata.lookRoundSectors)) {
+          scanner.finishRoom();
         }
       } catch (_) {}
     });
     try {
       final result = await scanner.startScanning();
       if (result == null) return null;
-      final scan = RoomPlanMapper.toScan(result, name: name);
-      if (scan.walls.length < 3) {
-        throw ScanFailure('Not enough walls were found. Scan the room again, '
-            'pointing the camera at every wall.');
-      }
-      return CapturedScan(scan,
-          automatic: true, complete: isClosedOutline(scan.walls));
+      return await _lidarResult(result, name);
     } on rp.ScanCancelledException {
       return null;
     } on rp.RoomPlanPermissionsException {
@@ -393,6 +439,67 @@ class RoomScanner {
       await updates.cancel();
       scanner.dispose();
     }
+  }
+
+  /// The finished LiDAR scan: one room, or several (a floor) lined up
+  /// together, with their photos (each in the room it was taken in, pinned
+  /// where it was taken) and suggested names. Photos are copied out of the
+  /// scanner's temporary folder.
+  static Future<CapturedScan> _lidarResult(rp.ScanResult result, String name) async {
+    final found = result.rooms.isEmpty
+        ? [rp.ScannedRoom(room: result.room)]
+        : result.rooms;
+    var scans = [for (final r in found) RoomPlanMapper.roomToScan(r.room, name: name)];
+    // Rooms with too few walls (a wardrobe scanned by mistake) are dropped.
+    final keep = [for (var i = 0; i < scans.length; i++) if (scans[i].walls.length >= 3) i];
+    if (keep.isEmpty) {
+      throw ScanFailure('Not enough walls were found. Scan the room again, '
+          'pointing the camera at every wall.');
+    }
+    final rooms = [for (final i in keep) found[i]];
+    scans = [for (final i in keep) scans[i]];
+
+    // Photos: each to the room it was taken in, with where it was taken.
+    final roomWalls = [for (final s in scans) s.walls];
+    for (final p in result.photos) {
+      final at = Vec2(p.x, p.z);
+      final k = RoomPlanMapper.roomForPoint(at, roomWalls, keep.indexOf(p.room));
+      try {
+        final file = await ScanStore.keepPhoto(p.path);
+        scans[k].photos.add(file);
+        scans[k].photoPins.add(PhotoPin(
+          file: file,
+          position: at,
+          direction: p.dirX == null || p.dirZ == null ? null : Vec2(p.dirX!, p.dirZ!),
+        ));
+      } catch (_) {}
+      try {
+        await File(p.path).delete();
+      } catch (_) {}
+    }
+
+    final names = RoomPlanMapper.uniqueNames([
+      for (var i = 0; i < scans.length; i++)
+        RoomPlanMapper.roomTypeName(rooms[i].type, scans[i].elements),
+    ]);
+
+    if (scans.length == 1) {
+      final scan = scans.single;
+      final typed = RoomPlanMapper.roomTypeName(rooms.single.type, scan.elements);
+      return CapturedScan(scan,
+          automatic: true, complete: isClosedOutline(scan.walls), suggestedName: typed);
+    }
+    // A floor: turned together so the longest wall is square to the page,
+    // each room keeping that orientation so they still line up.
+    final angle = RoomPlanMapper.alignmentAngle(roomWalls);
+    final aligned = [for (final s in scans) RoomPlanMapper.rotated(s, angle)];
+    return CapturedScan(aligned.first,
+        automatic: true,
+        complete: aligned.every((s) => isClosedOutline(s.walls)),
+        suggestedName: names.first,
+        floorRooms: aligned,
+        floorOffsets: RoomPlanMapper.mapOffsets(aligned),
+        floorSuggestedNames: names);
   }
 }
 
@@ -407,8 +514,16 @@ class LidarCompletion {
   double _area = 0;
   bool _fired = false;
 
+  /// Directions (of 12, 30° each) the camera must have looked in before the
+  /// scan finishes by itself, as in the guided scanner: doors and windows
+  /// are only found on walls that have been in view, and the outline can
+  /// close (from a few walls) before the user has turned to all of them.
+  static const lookRoundSectors = 10;
+
   /// Feeds the latest walls; true once (the moment to stop scanning).
-  bool update(List<WallLine> raw, DateTime now) {
+  /// [sectorsSeen]: how many of the 12 directions the camera has looked in
+  /// (null when the scanner does not report it: then not waited for).
+  bool update(List<WallLine> raw, DateTime now, {int? sectorsSeen}) {
     if (_fired) return false;
     final walls = orderWalls(raw);
     if (!isClosedOutline(walls)) {
@@ -425,6 +540,7 @@ class LidarCompletion {
       return false;
     }
     if (now.difference(_stableSince!) < hold) return false;
+    if (sectorsSeen != null && sectorsSeen < lookRoundSectors) return false;
     _fired = true;
     return true;
   }

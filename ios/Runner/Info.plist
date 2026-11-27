@@ -6,12 +6,14 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>The camera is used to scan your room and measure walls, doors and windows.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Bluetooth connects a laser meter (Leica DISTO) so its measurements go straight into your floor plan.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose a photo of a room to measure it from the picture.</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Planora</string>
+	<string>ECM-AI</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>

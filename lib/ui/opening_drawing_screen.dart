@@ -53,6 +53,13 @@ class _OpeningDrawingScreenState extends State<OpeningDrawingScreen> {
     await _update(o.copyWith(name: v.trim()));
   }
 
+  Future<void> _setRoom() async {
+    final v = await askText(context,
+        title: 'Room', initial: o.room, label: 'Room this ${o.type.label.toLowerCase()} is in');
+    if (v == null || v.trim().isEmpty) return;
+    await _update(o.copyWith(room: v.trim()));
+  }
+
   Future<void> _edit(String what) async {
     final current = switch (what) {
       'width' => o.width,
@@ -69,8 +76,9 @@ class _OpeningDrawingScreenState extends State<OpeningDrawingScreen> {
         initial: current);
     if (v == null || v.isNaN) return;
     await _update(switch (what) {
-      'width' => o.copyWith(width: v),
-      'height' => o.copyWith(height: v),
+      // Typed from a tape: no longer the scanner's estimate.
+      'width' => o.copyWith(width: v, estimated: false),
+      'height' => o.copyWith(height: v, estimated: false),
       _ => o.copyWith(sill: v),
     });
   }
@@ -112,6 +120,7 @@ class _OpeningDrawingScreenState extends State<OpeningDrawingScreen> {
     final color = o.type == OpeningType.window ? AppTheme.window : AppTheme.door;
     String len(double m) => '${o.estimated ? '≈ ' : ''}${formatLength(m, unit)}';
     final rows = <(String, String, String?)>[
+      ('Room', o.room.trim().isEmpty ? 'Add room' : o.room.trim(), 'room'),
       ('Width', len(o.width), 'width'),
       ('Height', o.height == null ? 'not measured' : len(o.height!), 'height'),
       if (o.type == OpeningType.window)
@@ -129,12 +138,19 @@ class _OpeningDrawingScreenState extends State<OpeningDrawingScreen> {
             borderRadius: BorderRadius.circular(AppTheme.radiusS),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(o.name, overflow: TextOverflow.ellipsis),
-              Text('${o.type.label} · ${formatDate(o.measuredAt)}',
+              Text(
+                  [
+                    if (o.room.trim().isNotEmpty) o.room.trim(),
+                    o.type.label,
+                    formatDate(o.measuredAt),
+                  ].join(' · '),
+                  key: const Key('opening-room'),
+                  overflow: TextOverflow.ellipsis,
                   style: theme.textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
             ]),
           ),
           actions: [
-            const UnitButton(),
+            const UnitButton(compact: true),
             IconButton(
                 tooltip: 'Share', onPressed: _share, icon: const Icon(Icons.ios_share_rounded)),
             IconButton(
@@ -210,7 +226,9 @@ class _OpeningDrawingScreenState extends State<OpeningDrawingScreen> {
                         Icon(Icons.edit_outlined, size: 16, color: cs.onSurfaceVariant),
                       ],
                     ]),
-                    onTap: r.$3 == null ? null : () => _edit(r.$3!),
+                    onTap: r.$3 == null
+                        ? null
+                        : () => r.$3 == 'room' ? _setRoom() : _edit(r.$3!),
                   ),
                 ],
               ]),
@@ -220,7 +238,7 @@ class _OpeningDrawingScreenState extends State<OpeningDrawingScreen> {
               [
                 o.method.label,
                 if (o.estimated) 'size estimated: check it with a tape',
-                'measured without a room, so it is not on a floor plan',
+                'measured without a room outline, so it is not on a floor plan',
               ].join('  ·  '),
               style: theme.textTheme.bodySmall?.copyWith(
                   color: o.estimated ? AppTheme.door : cs.onSurfaceVariant),

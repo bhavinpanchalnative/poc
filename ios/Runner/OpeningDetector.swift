@@ -220,11 +220,51 @@ enum OpeningDetector {
     var prominence: Float
   }
 
-  static func analyze(kind: OpeningKind, frame: WallFrame, image img: RectifiedImage) -> OpeningAnalysis {
-    let w = img.width, h = img.height
-    let door = kind == .door
-    let px = img.pixels
+  /// Horizontal aims tried by `search`, nearest the crosshair first (m).
+  private static let searchU: [Float] = [0, -0.5, 0.5, -1.0, 1.0]
+  /// Window aim heights tried by `search` above a known floor (m).
+  private static let searchWindowV: [Float] = [1.3, 1.0, 1.6]
 
+  /// Room scan: the door / window nearest the crosshair, not only one
+  /// around it. While a room is scanned the camera sweeps along the walls,
+  /// often aimed at the corners or where the walls meet the floor, so a door
+  /// or window is seldom right under the crosshair, and a window hardly
+  /// ever at its height. `analyze` is tried with the aim moved along the
+  /// wall (`searchU`) and, for windows over a known floor, to the heights
+  /// windows are at (`searchWindowV`); the first detection (nearest the
+  /// crosshair) wins. Same as `OpeningDetector.search` on Android.
+  static func search(kind: OpeningKind, frame: WallFrame, image img: RectifiedImage) -> OpeningAnalysis {
+    let grad = gradients(img)
+    var heights: [Float] = [frame.origin.y]
+    if kind == .window, let fy = frame.floorY {
+      for dv in searchWindowV {
+        let y = fy + dv
+        if !heights.contains(where: { abs($0 - y) < 0.2 }) { heights.append(y) }
+      }
+    }
+    var first: OpeningAnalysis?
+    for y in heights {
+      var f = frame
+      f.origin.y = y
+      for du in searchU {
+        let a = analyze(kind: kind, frame: f, image: img, uRef: du, gradients: grad)
+        if first == nil { first = a }
+        if a.candidate != nil { return a }
+      }
+    }
+    return first!
+  }
+
+  /// Sobel gradients of a rectified image (grey levels per cell); NaN next
+  /// to a cell the camera did not see.
+  struct Gradients {
+    var gx: [Float]
+    var gy: [Float]
+  }
+
+  static func gradients(_ img: RectifiedImage) -> Gradients {
+    let w = img.width, h = img.height
+    let px = img.pixels
     // Sobel gradients (scaled to grey levels per pixel). A cell next to a
     // missing one has none: the image border is not an edge.
     var gx = [Float](repeating: .nan, count: w * h)
@@ -244,6 +284,20 @@ enum OpeningDetector {
         }
       }
     }
+    return Gradients(gx: gx, gy: gy)
+  }
+
+  /// Looks for the door / window around the aim: the crosshair's foot
+  /// (`frame.origin`) moved `uRef` m along the wall; its sides are looked
+  /// for left and right of that point. `grad`: the image's gradients when
+  /// already computed (`gradients`).
+  static func analyze(kind: OpeningKind, frame: WallFrame, image img: RectifiedImage,
+                      uRef: Float = 0, gradients grad: Gradients? = nil) -> OpeningAnalysis {
+    let w = img.width, h = img.height
+    let door = kind == .door
+    let px = img.pixels
+    let grads = grad ?? gradients(img)
+    let gx = grads.gx, gy = grads.gy
 
     func rowIndex(_ v: Float) -> Int { Int(img.row(v).rounded()) }
     func colIndex(_ u: Float) -> Int { Int(img.col(u).rounded()) }
@@ -273,9 +327,9 @@ enum OpeningDetector {
     }
     var out = OpeningAnalysis(candidate: nil, columnProfile: colProf, rowProfile: [], failure: "")
 
-    let crossCol = img.col(0)
-    let left = peaks(colProf, colIndex(-halfWidth), colIndex(-0.12))
-    let right = peaks(colProf, colIndex(0.12), colIndex(halfWidth))
+    let crossCol = img.col(uRef)
+    let left = peaks(colProf, colIndex(uRef - halfWidth), colIndex(uRef - 0.12))
+    let right = peaks(colProf, colIndex(uRef + 0.12), colIndex(uRef + halfWidth))
     // Each strong edge proposes the inside edge of its casing as a side
     // (positions in cells, 1 cm); `outer` is the casing's farthest edge.
     func groups(_ ps: [Peak], towards: Float) -> [Side] {
@@ -508,10 +562,14 @@ enum OpeningDetector {
   /// up to 1.5 m and turn up to 30 degrees, and is then measured; a detected
   /// wall surface only up to 8 cm and 8 degrees, so that a misread line can
   /// never make it worse by more than its own error.
-  static func measure(kind: OpeningKind, frame: WallFrame, camera: CameraModel,
+  /// `wide` (room scan): looked for with `search`, not only around the crosshair.
+  static func measure(kind: OpeningKind, frame: WallFrame, camera: CameraModel, wide: Bool = false,
                       luminance: (Float, Float) -> Float?) -> Measured {
+    func find(_ f: WallFrame, _ i: RectifiedImage) -> OpeningAnalysis {
+      wide ? search(kind: kind, frame: f, image: i) : analyze(kind: kind, frame: f, image: i)
+    }
     let image = rectify(frame: frame, camera: camera, luminance: luminance)
-    let analysis = analyze(kind: kind, frame: frame, image: image)
+    let analysis = find(frame, image)
     let c = analysis.candidate
     guard let fl = wallFromFloorLine(frame: frame, camera: camera, image: image,
                                      skipLo: c?.left ?? .nan, skipHi: c?.right ?? .nan)
@@ -521,8 +579,7 @@ enum OpeningDetector {
       return Measured(frame: frame, image: image, analysis: analysis, floorLine: nil)
     }
     let image2 = rectify(frame: fl.frame, camera: camera, luminance: luminance)
-    return Measured(frame: fl.frame, image: image2, analysis: analyze(kind: kind, frame: fl.frame, image: image2),
-                    floorLine: fl)
+    return Measured(frame: fl.frame, image: image2, analysis: find(fl.frame, image2), floorLine: fl)
   }
 
   /// The wall where it really is, from the line along which it meets the
@@ -709,5 +766,187 @@ enum OpeningDetector {
       if abs(p.pos - towards) < abs(best.pos - towards) { best = p }
     }
     return best
+  }
+}
+
+// MARK: - Room scan counting, frame adjustment, aim smoothing
+// (twins of RoomOpeningCounter / OpeningFrameAdjust in OpeningDetector.kt
+// and AimSmoother.kt; keep them in sync).
+
+/// Doors and windows counted automatically while a room is scanned (Auto
+/// mode): which steady detections are real doors / windows, and which repeat
+/// one already counted.
+enum RoomOpeningCounter {
+  /// Detections whose centres are closer than this (m) are one opening.
+  static let duplicate: Float = 0.5
+
+  /// Whether a steady detection has a door's or a window's proportions
+  /// (and, when the floor is known, sits where one would). Anything else (a
+  /// picture frame, a wardrobe front, a radiator) is not counted.
+  static func plausible(_ kind: OpeningKind, width: Float, height: Float, bottom: Float,
+                        floorY: Float?) -> Bool {
+    switch kind {
+    case .door:
+      return width >= 0.6 && width <= 1.4 && height >= 1.75 && height <= 2.5
+        && (floorY.map { abs(bottom - $0) <= 0.12 } ?? true)
+    case .window:
+      return width >= 0.35 && width <= 3.2 && height >= 0.35 && height <= 2.3
+        && (floorY.map { bottom - $0 >= 0.15 && bottom - $0 <= 1.9 } ?? true)
+    }
+  }
+
+  /// Whether door detection `door` is really the window `window` found in
+  /// the same image: the door's bottom is taken at the floor, so a window's
+  /// sides and top can read as a door. A window clearly above the floor
+  /// (sill over 30 cm) spanning most of the door's width means it is not one.
+  static func doorIsWindow(_ door: OpeningCandidate, _ window: OpeningCandidate?, floorY: Float?) -> Bool {
+    guard let window else { return false }
+    guard let sill = window.sill ?? floorY.map({ window.bottom - $0 }) else { return false }
+    if sill < 0.30 { return false }
+    let overlap = min(door.right, window.right) - max(door.left, window.left)
+    return overlap >= 0.5 * min(door.width, window.width)
+  }
+
+  /// Centre of an opening from its bottom corners and heights.
+  static func centre(_ a: V3, _ b: V3, bottom: Float, top: Float) -> V3 {
+    V3((a.x + b.x) / 2, (bottom + top) / 2, (a.z + b.z) / 2)
+  }
+
+  /// Index in `existing` (opening centres) of the one at `centre`, or nil.
+  static func duplicateOf(_ centre: V3, _ existing: [V3]) -> Int? {
+    var best: Int?
+    var bestD = duplicate
+    for (i, e) in existing.enumerated() {
+      let d = simd_length(e - centre)
+      if d < bestD {
+        bestD = d
+        best = i
+      }
+    }
+    return best
+  }
+}
+
+/// Adjusting the door / window frame found by hand, on the camera view. The
+/// frame is a rectangle on its wall: left / right (m along the wall), bottom
+/// / top (heights). Each side has its own handle, a circle at its middle,
+/// and moving one side never moves another (corner handles moved two).
+enum OpeningFrameAdjust {
+  static let bottom = 0
+  static let right = 1
+  static let top = 2
+  static let left = 3
+
+  /// Smallest width / height a side may leave (m).
+  static let minSize: Float = 0.10
+
+  /// The side under a finger at `p`: `s` are the frame's corners on screen
+  /// (bottom-left, bottom-right, top-right, top-left; nil behind the
+  /// camera), side i running from corner i to i + 1. A handle (side middle)
+  /// within `handleRadius` wins; otherwise the nearest line within
+  /// `lineRadius`. nil when none.
+  static func pickSide(_ s: [SIMD2<Float>?], _ p: SIMD2<Float>, handleRadius: Float,
+                       lineRadius: Float) -> Int? {
+    guard s.count == 4 else { return nil }
+    var best: Int?
+    var bestD = handleRadius
+    for i in 0..<4 {
+      guard let a = s[i], let b = s[(i + 1) % 4] else { continue }
+      let d = simd_length((a + b) / 2 - p)
+      if d < bestD {
+        bestD = d
+        best = i
+      }
+    }
+    if best != nil { return best }
+    bestD = lineRadius
+    for i in 0..<4 {
+      guard let a = s[i], let b = s[(i + 1) % 4] else { continue }
+      let ab = b - a
+      let len2 = simd_length_squared(ab)
+      let t: Float = len2 > 0 ? min(max(simd_dot(p - a, ab) / len2, 0), 1) : 0
+      let d = simd_length(a + ab * t - p)
+      if d < bestD {
+        bestD = d
+        best = i
+      }
+    }
+    return best
+  }
+
+  /// Whether `side` runs up the wall (its position is along the wall).
+  static func isVertical(_ side: Int) -> Bool { side == Self.left || side == Self.right }
+
+  /// The current position of `side`.
+  static func sideValue(_ side: Int, left l: Float, right r: Float, bottom b: Float, top t: Float) -> Float {
+    switch side {
+    case Self.left: return l
+    case Self.right: return r
+    case Self.bottom: return b
+    default: return t
+    }
+  }
+
+  /// `side` moved to `value`; every other side stays exactly where it is.
+  /// The side stops `minSize` short of the opposite one.
+  static func moveSide(_ side: Int, to value: Float, left l: Float, right r: Float, bottom b: Float,
+                       top t: Float) -> (left: Float, right: Float, bottom: Float, top: Float) {
+    switch side {
+    case Self.left: return (min(value, r - minSize), r, b, t)
+    case Self.right: return (l, max(value, l + minSize), b, t)
+    case Self.bottom: return (l, r, min(value, t - minSize), t)
+    case Self.top: return (l, r, b, max(value, b + minSize))
+    default: return (l, r, b, t)
+    }
+  }
+}
+
+/// Steadies the point under the crosshair. A single frame's hit jitters by
+/// a centimetre or more (depth noise, tracking noise, the hand). When the
+/// phone is held still, the per-axis median of the last `window` seconds of
+/// hits is used instead, so one frame's noise no longer goes into a mark.
+struct AimSmoother {
+  var window: TimeInterval = 0.35
+  /// Hits further than this from the median (m) mean the aim moved.
+  var steady: Float = 0.03
+  /// Fewest hits worth a median.
+  var minHits = 4
+
+  private var times = [TimeInterval]()
+  private var points = [V3]()
+
+  init() {}
+
+  /// Records the hit of the frame at `now` (seconds); nil when nothing is
+  /// under the crosshair, which starts over.
+  mutating func add(_ now: TimeInterval, _ hit: V3?) {
+    guard let hit else {
+      clear()
+      return
+    }
+    times.append(now)
+    points.append(hit)
+    while let first = times.first, now - first > window {
+      times.removeFirst()
+      points.removeFirst()
+    }
+  }
+
+  mutating func clear() {
+    times.removeAll()
+    points.removeAll()
+  }
+
+  /// The median of the recent hits when there are enough and they all
+  /// agree (the aim was held still), else `latest` (the aim is moving).
+  func point(_ latest: V3) -> V3 {
+    if points.count < minHits { return latest }
+    func median(_ v: [Float]) -> Float {
+      let s = v.sorted()
+      return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
+    }
+    let m = V3(median(points.map { $0.x }), median(points.map { $0.y }), median(points.map { $0.z }))
+    for p in points where simd_length(p - m) > steady { return latest }
+    return simd_length(latest - m) > steady ? latest : m
   }
 }

@@ -216,9 +216,10 @@ internal object OpeningDetector {
      * a detected wall surface only up to 8 cm and 8 degrees, so that a
      * misread line can never make it worse by more than its own error.
      */
-    fun measure(kind: OpeningKind, frame: WallFrame, camera: CameraModel, lum: Luminance): Measured {
+    fun measure(kind: OpeningKind, frame: WallFrame, camera: CameraModel, lum: Luminance, wide: Boolean = false): Measured {
+        val find = { f: WallFrame, i: RectifiedImage -> if (wide) search(kind, f, i) else analyze(kind, f, i) }
         val img = rectify(frame, camera, lum)
-        val det = analyze(kind, frame, img)
+        val det = find(frame, img)
         val c = det.candidate
         val fl = wallFromFloorLine(frame, camera, img, c?.left ?: Float.NaN, c?.right ?: Float.NaN)
         val ok = fl != null && if (frame.estimated) abs(fl.moved) <= 1.5f && fl.turned <= 30f
@@ -227,21 +228,56 @@ internal object OpeningDetector {
             return Measured(frame, img, det, null)
         }
         val img2 = rectify(fl.frame, camera, lum)
-        return Measured(fl.frame, img2, analyze(kind, fl.frame, img2), fl)
+        return Measured(fl.frame, img2, find(fl.frame, img2), fl)
     }
 
-    private class Peak(val pos: Float, val value: Float, val prominence: Float)
+    /** Horizontal aims tried by [search], nearest the crosshair first (m). */
+    private val SEARCH_U = floatArrayOf(0f, -0.5f, 0.5f, -1.0f, 1.0f)
+    /** Window aim heights tried by [search] above a known floor (m). */
+    private val SEARCH_WINDOW_V = floatArrayOf(1.3f, 1.0f, 1.6f)
 
-    /** One edge or a group of parallel ones (casing): [pos] is the member
-     *  nearest the crosshair, [outer] the one farthest from it, [score] the
-     *  strongest member's prominence. */
-    private class Edge(val pos: Float, val prominence: Float, val score: Float, val outer: Float = pos)
+    /**
+     * Room scan: the door / window nearest the crosshair, not only one
+     * around it. While a room is scanned the camera sweeps along the walls,
+     * often aimed at the corners or where the walls meet the floor, so a
+     * door or window is seldom right under the crosshair, and a window
+     * hardly ever at its height. [analyze] is tried with the aim moved
+     * along the wall ([SEARCH_U]) and, for windows over a known floor, to
+     * the heights windows are at ([SEARCH_WINDOW_V]); the first detection
+     * (nearest the crosshair) wins. The image is the same: only where the
+     * frame is looked for changes.
+     */
+    fun search(kind: OpeningKind, frame: WallFrame, img: RectifiedImage): OpeningDetection {
+        val grad = gradients(img)
+        val heights = ArrayList<Float>()
+        heights.add(frame.origin.y)
+        val fy = frame.floorY
+        if (kind == OpeningKind.WINDOW && fy != null) {
+            for (dv in SEARCH_WINDOW_V) {
+                val y = fy + dv
+                if (heights.none { abs(it - y) < 0.2f }) heights.add(y)
+            }
+        }
+        var first: OpeningDetection? = null
+        for (y in heights) {
+            val f = if (y == frame.origin.y) frame else WallFrame(frame.origin.withY(y), frame.normal, fy, frame.estimated)
+            for (du in SEARCH_U) {
+                val d = analyze(kind, f, img, du, grad)
+                if (first == null) first = d
+                if (d.candidate != null) return d
+            }
+        }
+        return first!!
+    }
 
-    fun analyze(kind: OpeningKind, frame: WallFrame, img: RectifiedImage): OpeningDetection {
+    /** Sobel gradients of a rectified image (/8: luminance levels per
+     *  cell); [valid] false (and 0) next to a cell the camera did not see. */
+    internal class Gradients(val gx: FloatArray, val gy: FloatArray, val valid: BooleanArray)
+
+    fun gradients(img: RectifiedImage): Gradients {
         val w = img.width
         val h = img.height
         val n = w * h
-        // Sobel gradients (/8: luminance levels per cell); 0 next to NaN.
         val gx = FloatArray(n)
         val gy = FloatArray(n)
         val valid = BooleanArray(n)
@@ -266,6 +302,30 @@ internal object OpeningDetector {
                 gy[i] = ((g + 2 * hh + k) - (a + 2 * b + cc)) / 8f
             }
         }
+        return Gradients(gx, gy, valid)
+    }
+
+    private class Peak(val pos: Float, val value: Float, val prominence: Float)
+
+    /** One edge or a group of parallel ones (casing): [pos] is the member
+     *  nearest the crosshair, [outer] the one farthest from it, [score] the
+     *  strongest member's prominence. */
+    private class Edge(val pos: Float, val prominence: Float, val score: Float, val outer: Float = pos)
+
+    /**
+     * Looks for the door / window around the aim: the crosshair's foot
+     * ([frame].origin) moved [uRef] m along the wall; its sides are looked
+     * for left and right of that point.
+     */
+    fun analyze(
+        kind: OpeningKind, frame: WallFrame, img: RectifiedImage, uRef: Float = 0f, grad: Gradients = gradients(img),
+    ): OpeningDetection {
+        val w = img.width
+        val h = img.height
+        val gx = grad.gx
+        val gy = grad.gy
+        val valid = grad.valid
+        val p = img.pixels
         val o = frame.origin
         val base = frame.base
         val door = kind == OpeningKind.DOOR
@@ -301,8 +361,8 @@ internal object OpeningDetector {
         fun fail() = OpeningDetection(null, colProfile, rowProfile)
 
         // Sides.
-        val lefts = edges(peaks(colProfile, colsFor(-U_HALF, -SIDE_GAP), img::u), 0f)
-        val rights = edges(peaks(colProfile, colsFor(SIDE_GAP, U_HALF), img::u), 0f)
+        val lefts = edges(peaks(colProfile, colsFor(uRef - U_HALF, uRef - SIDE_GAP), img::u), uRef)
+        val rights = edges(peaks(colProfile, colsFor(uRef + SIDE_GAP, uRef + U_HALF), img::u), uRef)
         val (minW, maxW) = if (door) 0.55f to 2.0f else 0.3f to 3.0f
         var bestL: Edge? = null
         var bestR: Edge? = null
@@ -722,7 +782,13 @@ internal object OpeningDetector {
  * least 4 agree with the per-edge median within 2 cm; that median is the
  * result. A candidate elsewhere drops the others.
  */
-internal class OpeningConsensus(private val capacity: Int = 8) {
+internal class OpeningConsensus(
+    private val capacity: Int = 8,
+    /** Edges agree within this (m). */
+    private val agree: Float = AGREE,
+    /** Stable once this many agree. */
+    private val minAgree: Int = MIN_AGREE,
+) {
     private class Entry(val frame: WallFrame, val c: OpeningCandidate)
 
     class State(val candidate: OpeningCandidate, val frame: WallFrame, val stable: Boolean, val count: Int, val agreeing: Int)
@@ -759,7 +825,7 @@ internal class OpeningConsensus(private val capacity: Int = 8) {
         val t = median(ts)
         var agreeing = 0
         for (i in entries.indices) {
-            if (abs(ls[i] - l) <= AGREE && abs(rs[i] - r) <= AGREE && abs(bs[i] - b) <= AGREE && abs(ts[i] - t) <= AGREE) {
+            if (abs(ls[i] - l) <= agree && abs(rs[i] - r) <= agree && abs(bs[i] - b) <= agree && abs(ts[i] - t) <= agree) {
                 agreeing++
             }
         }
@@ -769,7 +835,7 @@ internal class OpeningConsensus(private val capacity: Int = 8) {
             if (sills.isEmpty()) null else median(sills),
             median(entries.map { it.c.strength }), c.estimated,
         )
-        val s = State(med, frame, agreeing >= MIN_AGREE, entries.size, agreeing)
+        val s = State(med, frame, agreeing >= minAgree, entries.size, agreeing)
         state = s
         return s
     }
@@ -788,5 +854,146 @@ internal class OpeningConsensus(private val capacity: Int = 8) {
         const val SAME_OPENING = 0.30f
         private const val AGREE = 0.02f
         const val MIN_AGREE = 4
+
+        /**
+         * For counting during a room scan. There the camera sweeps past a
+         * door or window instead of being held on it, so 4 detections within
+         * 2 cm (about 2 s held still) were seldom reached and nothing was
+         * counted. 3 within 4 cm still rejects one-off misreads; the size can
+         * be refined afterwards in Door / Window mode or by hand.
+         */
+        fun forRoomScan() = OpeningConsensus(capacity = 6, agree = 0.04f, minAgree = 3)
     }
+}
+
+/**
+ * Doors and windows counted automatically while a room is scanned (Auto
+ * mode): which steady detections are real doors / windows, and which repeat
+ * one already counted. Free of Android types so it can be unit tested.
+ */
+internal object RoomOpeningCounter {
+    /** Detections whose centres are closer than this (m) are one opening. */
+    const val DUPLICATE = 0.5f
+
+    /** Whether a steady detection has a door's or a window's proportions
+     *  (and, when the floor is known, sits where one would). Anything else
+     *  (a picture frame, a wardrobe front, a radiator) is not counted. */
+    fun plausible(kind: OpeningKind, c: OpeningCandidate, floorY: Float?): Boolean = when (kind) {
+        OpeningKind.DOOR ->
+            c.width in 0.6f..1.4f && c.height in 1.75f..2.5f &&
+                (floorY == null || abs(c.bottom - floorY) <= 0.12f)
+        OpeningKind.WINDOW ->
+            c.width in 0.35f..3.2f && c.height in 0.35f..2.3f &&
+                (floorY == null || (c.bottom - floorY) in 0.15f..1.9f)
+    }
+
+    /**
+     * Whether door detection [door] is really the window [window] found in
+     * the same image: the door's bottom is taken at the floor, so a window's
+     * sides and top can read as a door. A window clearly above the floor
+     * (sill over 30 cm) spanning most of the door's width means it is not one.
+     */
+    fun doorIsWindow(door: OpeningCandidate, window: OpeningCandidate?, floorY: Float?): Boolean {
+        if (window == null) return false
+        val sill = window.sill ?: floorY?.let { window.bottom - it } ?: return false
+        if (sill < 0.30f) return false
+        val overlap = min(door.right, window.right) - max(door.left, window.left)
+        return overlap >= 0.5f * min(door.width, window.width)
+    }
+
+    /** Centre of an opening from its bottom corners and heights. */
+    fun centre(a: Vec3, b: Vec3, bottom: Float, top: Float) =
+        Vec3((a.x + b.x) / 2f, (bottom + top) / 2f, (a.z + b.z) / 2f)
+
+    /** Index in [existing] (opening centres) of the one at [centre], or -1. */
+    fun duplicateOf(centre: Vec3, existing: List<Vec3>): Int {
+        var best = -1
+        var bestD = DUPLICATE
+        for ((i, e) in existing.withIndex()) {
+            val d = e - centre
+            val dist = sqrt(d.dot(d))
+            if (dist < bestD) {
+                bestD = dist
+                best = i
+            }
+        }
+        return best
+    }
+}
+
+/**
+ * Adjusting the door / window frame found by hand, on the camera view. The
+ * frame is a rectangle on its wall: left / right (m along the wall), bottom
+ * / top (heights). Each side has its own handle, a circle at its middle,
+ * and moving one side never moves another: no corner handles, which moved
+ * two sides at once.
+ */
+internal object OpeningFrameAdjust {
+    const val BOTTOM = 0
+    const val RIGHT = 1
+    const val TOP = 2
+    const val LEFT = 3
+
+    /** Smallest width / height a side may leave (m). */
+    const val MIN_SIZE = 0.10f
+
+    /**
+     * The side under a finger at ([x], [y]): [s] are the frame's corners on
+     * screen (bottom-left, bottom-right, top-right, top-left; null behind
+     * the camera), side i running from corner i to i + 1. A handle (side
+     * middle) within [handleRadius] wins; otherwise the nearest line within
+     * [lineRadius]. -1 when none.
+     */
+    fun pickSide(s: List<FloatArray?>, x: Float, y: Float, handleRadius: Float, lineRadius: Float): Int {
+        var best = -1
+        var bestD = handleRadius
+        for (i in 0 until 4) {
+            val p = s[i] ?: continue
+            val q = s[(i + 1) % 4] ?: continue
+            val d = kotlin.math.hypot((p[0] + q[0]) / 2f - x, (p[1] + q[1]) / 2f - y)
+            if (d < bestD) {
+                bestD = d
+                best = i
+            }
+        }
+        if (best >= 0) return best
+        bestD = lineRadius
+        for (i in 0 until 4) {
+            val p = s[i] ?: continue
+            val q = s[(i + 1) % 4] ?: continue
+            val dx = q[0] - p[0]
+            val dy = q[1] - p[1]
+            val len2 = dx * dx + dy * dy
+            // Not the last bit near a corner: that is as close to the other side.
+            val t = if (len2 > 0f) (((x - p[0]) * dx + (y - p[1]) * dy) / len2).coerceIn(0f, 1f) else 0f
+            val d = kotlin.math.hypot(p[0] + dx * t - x, p[1] + dy * t - y)
+            if (d < bestD) {
+                bestD = d
+                best = i
+            }
+        }
+        return best
+    }
+
+    /** The current position of [side]. */
+    fun sideValue(side: Int, left: Float, right: Float, bottom: Float, top: Float) = when (side) {
+        LEFT -> left
+        RIGHT -> right
+        BOTTOM -> bottom
+        else -> top
+    }
+
+    /**
+     * [side] moved to [value]; every other side stays exactly where it is.
+     * The side stops [MIN_SIZE] short of the opposite one. Returns
+     * (left, right, bottom, top).
+     */
+    fun moveSide(side: Int, value: Float, left: Float, right: Float, bottom: Float, top: Float): FloatArray =
+        when (side) {
+            LEFT -> floatArrayOf(min(value, right - MIN_SIZE), right, bottom, top)
+            RIGHT -> floatArrayOf(left, max(value, left + MIN_SIZE), bottom, top)
+            BOTTOM -> floatArrayOf(left, right, min(value, top - MIN_SIZE), top)
+            TOP -> floatArrayOf(left, right, bottom, max(value, bottom + MIN_SIZE))
+            else -> floatArrayOf(left, right, bottom, top)
+        }
 }

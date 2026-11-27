@@ -7,6 +7,24 @@ import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
     private var pending: MethodChannel.Result? = null
+    private var pendingBluetooth: MethodChannel.Result? = null
+
+    /** Android 12+: scan and connect; older: location (needed to scan). */
+    private fun bluetoothPermissions(): List<String> =
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            listOf(android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            listOf(android.Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQ_BLUETOOTH) return
+        pendingBluetooth?.success(
+            grantResults.isNotEmpty() && grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED },
+        )
+        pendingBluetooth = null
+    }
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
@@ -36,7 +54,7 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     // Opens the camera measuring screen. Returns null when the
-                    // user backs out, {error} on failure, or {xs, zs, height?,
+                    // user backs out, {error} on failure, or {xs, zs,
                     // openings, floorY?, openingDetails, surfaces, lines,
                     // lineOnly, ...}. With {"startMode": "line"} it opens just
                     // to measure distances: xs and zs are then empty.
@@ -54,6 +72,21 @@ class MainActivity : FlutterActivity() {
                                 },
                                 REQ_MEASURE,
                             )
+                        }
+                    }
+                    // Laser meter: asks for the Bluetooth permissions needed
+                    // to find and connect to it. Returns true when granted.
+                    "bluetoothPermission" -> {
+                        val needed = bluetoothPermissions().filter {
+                            checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+                        }
+                        if (needed.isEmpty()) {
+                            result.success(true)
+                        } else if (pendingBluetooth != null) {
+                            result.error("busy", "Already asking", null)
+                        } else {
+                            pendingBluetooth = result
+                            requestPermissions(needed.toTypedArray(), REQ_BLUETOOTH)
                         }
                     }
                     else -> result.notImplemented()
@@ -90,9 +123,6 @@ class MainActivity : FlutterActivity() {
         }
         out["auto"] = data.getBooleanExtra(ArMeasureActivity.EXTRA_AUTO, false)
         out["estimated"] = data.getIntExtra(ArMeasureActivity.EXTRA_ESTIMATED, 0)
-        if (data.hasExtra(ArMeasureActivity.EXTRA_HEIGHT)) {
-            out["height"] = data.getDoubleExtra(ArMeasureActivity.EXTRA_HEIGHT, 0.0)
-        }
         if (data.hasExtra(ArMeasureActivity.EXTRA_FLOOR_Y)) {
             out["floorY"] = data.getDoubleExtra(ArMeasureActivity.EXTRA_FLOOR_Y, 0.0)
         }
@@ -117,11 +147,15 @@ class MainActivity : FlutterActivity() {
         }
         // AR photos with the measurements drawn in (absolute JPEG paths).
         out["photos"] = data.getStringArrayExtra(ArMeasureActivity.EXTRA_PHOTOS)?.toList() ?: emptyList<String>()
+        // Furniture found by the AI detector: 6 values each, kinds alongside.
+        out["elements"] = (data.getDoubleArrayExtra(ArMeasureActivity.EXTRA_ELEMENTS) ?: DoubleArray(0)).toList()
+        out["elementKinds"] = data.getStringArrayExtra(ArMeasureActivity.EXTRA_ELEMENT_KINDS)?.toList() ?: emptyList<String>()
         result.success(out)
     }
 
     companion object {
         private const val CHANNEL = "room_measure/ar"
         private const val REQ_MEASURE = 4201
+        private const val REQ_BLUETOOTH = 4202
     }
 }

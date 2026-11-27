@@ -12,12 +12,11 @@ import 'package:room_measure/engine/units.dart';
 import 'package:room_measure/services/plan_exporter.dart';
 import 'package:room_measure/ui/opening_editor_screen.dart';
 
-/// A 4.0 x 3.0 m room, 2.5 m high, with a door and a window on wall W1.
+/// A 4.0 x 3.0 m room with a door and a window on wall W1.
 FloorPlan plan() {
   final scan = scanFromCorners(
     [Vec2.zero, const Vec2(4, 0), const Vec2(4, 3), const Vec2(0, 3)],
     name: 'Room',
-    height: 2.5,
     openings: const [
       MarkedOpening(OpeningType.door, Vec2(0.5, 0), Vec2(1.32, 0),
           height: 2.03, method: OpeningMethod.auto),
@@ -66,8 +65,10 @@ void main() {
     e = e.withEdge(OpeningEdge.bottom, 0.80); // sill down 10 cm, top stays
     expect(e.sill, closeTo(0.80, 1e-9));
     expect(e.head, closeTo(2.0, 1e-9));
-    e = e.withEdge(OpeningEdge.top, 9); // can't go above the ceiling
-    expect(e.head, closeTo(2.5, 1e-9));
+    // No ceiling is measured any more: the top stops at a sane maximum.
+    e = e.withEdge(OpeningEdge.top, 9);
+    expect(e.head, closeTo(OpeningElevation.maxHead, 1e-9));
+    e = e.withEdge(OpeningEdge.top, 2.0);
     e = e.withEdge(OpeningEdge.left, e.right + 1); // can't cross the other edge
     expect(e.width, closeTo(OpeningElevation.minSize, 1e-9));
 
@@ -97,7 +98,6 @@ void main() {
     final e = OpeningElevation.of(p, p.openings.single);
     expect(e.heightAssumed, isTrue);
     expect(e.sillAssumed, isTrue);
-    expect(e.wallHeightAssumed, isTrue);
     // Saving without editing keeps them unmeasured.
     final o = e.toOpening(p.openings.single);
     expect(o.height, isNull);
@@ -150,7 +150,7 @@ void main() {
             source: CaptureSource.arTap,
             walls: [for (var i = 0; i < 4; i++)
                 WallLine(p.wallStart(i), p.wallEnd(i))],
-            openings: List.of(p.openings), height: 2.5),
+            openings: List.of(p.openings)),
         p,
         LengthUnit.meters);
     expect(pdf.length, greaterThan(10000));

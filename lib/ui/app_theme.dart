@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-/// Planora's design system: one place for the brand, colours, type and the
+/// ECM-AI's design system: one place for the brand, colours, type and the
 /// shape of every component, used by every screen on Android and iOS.
 ///
 /// Palette: deep navy ink for text and dark surfaces, "plan blue" for actions
@@ -10,7 +10,7 @@ import 'package:flutter/material.dart';
 class AppTheme {
   // ---------------------------------------------------------------- brand
 
-  static const appName = 'Planora';
+  static const appName = 'ECM-AI';
   static const tagline = 'Scan. Measure. Plan.';
 
   // ---------------------------------------------------------------- colours

@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -10,6 +11,7 @@ import 'package:pdf/widgets.dart' as pw;
 import '../engine/elevation.dart';
 import '../engine/floor_map.dart';
 import '../engine/floor_plan_builder.dart';
+import '../engine/geometry.dart';
 import '../engine/models.dart';
 import '../engine/units.dart';
 import '../ui/app_theme.dart';
@@ -26,10 +28,11 @@ class PlanExporter {
     LengthUnit unit, {
     String? title,
     Size size = const Size(1600, 1200),
+    List<(Vec2, double, double, double, String)> furniture = const [],
   }) async {
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
-    PlanPainter(plan: plan, unit: unit, title: title).paint(canvas, size);
+    PlanPainter(plan: plan, unit: unit, title: title, furniture: furniture).paint(canvas, size);
     final image = await recorder
         .endRecording()
         .toImage(size.width.round(), size.height.round());
@@ -84,12 +87,8 @@ class PlanExporter {
 
   static Future<Uint8List> _logoPng() async {
     if (_logo != null) return _logo!;
-    const px = 96;
-    final recorder = ui.PictureRecorder();
-    const PlanoraMarkPainter().paint(Canvas(recorder), const Size(96, 96));
-    final image = await recorder.endRecording().toImage(px, px);
-    final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
-    return _logo = bytes!.buffer.asUint8List();
+    final bytes = await rootBundle.load(brandLogoAsset);
+    return _logo = bytes.buffer.asUint8List(bytes.offsetInBytes, bytes.lengthInBytes);
   }
 
   static final _ink = PdfColor.fromInt(AppTheme.ink.toARGB32());
@@ -105,10 +104,8 @@ class PlanExporter {
         decoration: const pw.BoxDecoration(
             border: pw.Border(bottom: pw.BorderSide(color: _hairline, width: 1))),
         child: pw.Row(children: [
-          pw.Image(pw.MemoryImage(logo), width: 18, height: 18),
-          pw.SizedBox(width: 6),
-          pw.Text(AppTheme.appName,
-              style: pw.TextStyle(fontSize: 11, fontWeight: pw.FontWeight.bold, color: _ink)),
+          // The ECM-AI logo (753 × 211).
+          pw.Image(pw.MemoryImage(logo), height: 24, fit: pw.BoxFit.contain),
           pw.Spacer(),
           pw.Text(title, style: const pw.TextStyle(fontSize: 9, color: _muted)),
         ]),
@@ -154,7 +151,7 @@ class PlanExporter {
 
   static Future<File> savePng(
       RoomScan scan, FloorPlan plan, LengthUnit unit) async {
-    final png = await renderPng(plan, unit, title: scan.name);
+    final png = await renderPng(plan, unit, title: scan.name, furniture: furnitureOnPlan(scan, plan));
     final dir = await ScanStore.exportsDir();
     final f = File('${dir.path}${Platform.pathSeparator}'
         '${safeName(scan.name)}_${scan.id}.png');
@@ -165,6 +162,7 @@ class PlanExporter {
   /// Summary rows shared by the PDF and the app.
   static List<(String, String)> summary(FloorPlan plan, LengthUnit unit) {
     final size = plan.overallSize;
+    final ceiling = plan.ceilingHeight;
     return [
       ('Floor area', formatArea(plan.area, unit)),
       ('Perimeter', formatLength(plan.perimeter, unit)),
@@ -172,18 +170,100 @@ class PlanExporter {
         'Overall size',
         '${formatLength(size.width, unit)} × ${formatLength(size.depth, unit)}'
       ),
-      if (plan.height != null)
-        ('Ceiling height', formatLength(plan.height!, unit)),
-      if (plan.volume != null) ('Volume', formatVolume(plan.volume!, unit)),
-      if (plan.netWallArea != null)
-        ('Wall area (net)', formatArea(plan.netWallArea!, unit)),
+      if (ceiling != null) ('Ceiling height', formatLength(ceiling, unit)),
+      if (ceiling != null) ('Wall area', formatArea(wallArea(plan), unit)),
       ('Walls', '${plan.wallCount}'),
+      (
+        'Doors · Windows',
+        '${plan.openings.where((o) => o.type == OpeningType.door).length} · '
+            '${plan.openings.where((o) => o.type == OpeningType.window).length}'
+      ),
     ];
+  }
+
+  /// Area of the walls (m²) for painting or tiling: perimeter × ceiling
+  /// height, less the doors, windows and openings (their measured height,
+  /// else a typical one). 0 when the ceiling height isn't known.
+  static double wallArea(FloorPlan plan) {
+    final h = plan.ceilingHeight;
+    if (h == null) return 0;
+    var area = plan.perimeter * h;
+    for (final o in plan.openings) {
+      final oh = math.min(o.height ?? o.type.typicalHeight, h);
+      area -= o.width * oh;
+    }
+    return math.max(0, area);
+  }
+
+  // ------------------------------------------------------------------ CSV
+
+  /// The rooms' measurements as CSV (opens in Excel or Numbers): a table of
+  /// rooms (areas, sizes, ceiling height, counts), one of walls and one of
+  /// doors and windows, separated by a blank line. Lengths are plain numbers
+  /// in metres, or feet for imperial units ([unit]), so they can be summed.
+  static String csv(List<(RoomScan, FloorPlan)> rooms, LengthUnit unit) {
+    final imperial = unit == LengthUnit.feetInches || unit == LengthUnit.inches;
+    final lu = imperial ? 'ft' : 'm';
+    final au = imperial ? 'sq ft' : 'm²';
+    String l(double? m) => m == null ? '' : (imperial ? m / 0.3048 : m).toStringAsFixed(2);
+    String a(double m2) => (imperial ? m2 / (0.3048 * 0.3048) : m2).toStringAsFixed(2);
+    String q(String s) => '"${s.replaceAll('"', '""')}"';
+    String row(List<String> cells) => cells.join(',');
+
+    final out = <String>[
+      row([
+        'Room', 'Floor area ($au)', 'Perimeter ($lu)', 'Width ($lu)', 'Depth ($lu)',
+        'Ceiling height ($lu)', 'Wall area ($au)', 'Walls', 'Doors', 'Windows', 'Openings', 'Objects',
+      ]),
+      for (final (s, p) in rooms)
+        row([
+          q(s.name),
+          a(p.area),
+          l(p.perimeter),
+          l(p.overallSize.width),
+          l(p.overallSize.depth),
+          l(p.ceilingHeight),
+          p.ceilingHeight == null ? '' : a(wallArea(p)),
+          '${p.wallCount}',
+          '${p.openings.where((o) => o.type == OpeningType.door).length}',
+          '${p.openings.where((o) => o.type == OpeningType.window).length}',
+          '${p.openings.where((o) => o.type == OpeningType.opening).length}',
+          '${s.elements.length}',
+        ]),
+      if (rooms.length > 1)
+        row([
+          q('Total'),
+          a(rooms.fold(0.0, (t, r) => t + r.$2.area)),
+          '', '', '', '',
+          a(rooms.fold(0.0, (t, r) => t + wallArea(r.$2))),
+          '', '', '', '', '',
+        ]),
+      '',
+      row(['Room', 'Wall', 'Length ($lu)']),
+      for (final (s, p) in rooms)
+        for (var i = 0; i < p.wallCount; i++) row([q(s.name), '${i + 1}', l(p.wallLength(i))]),
+      '',
+      row(['Room', 'Type', 'Wall', 'Width ($lu)', 'Height ($lu)', 'Sill ($lu)']),
+      for (final (s, p) in rooms)
+        for (final o in p.openings)
+          row([q(s.name), o.type.label, '${o.wallIndex + 1}', l(o.width), l(o.height), l(o.sill)]),
+    ];
+    // CRLF and a byte-order mark: Excel then reads the file as UTF-8 (m², ×).
+    return '﻿${out.join('\r\n')}\r\n';
+  }
+
+  static Future<File> saveCsv(List<(RoomScan, FloorPlan)> rooms, LengthUnit unit,
+      {required String name}) async {
+    final dir = await ScanStore.exportsDir();
+    final f = File('${dir.path}${Platform.pathSeparator}'
+        '${safeName(name)}_${DateTime.now().millisecondsSinceEpoch}.csv');
+    await f.writeAsString(csv(rooms, unit));
+    return f;
   }
 
   static Future<Uint8List> buildPdf(
       RoomScan scan, FloorPlan plan, LengthUnit unit) async {
-    final png = await renderPng(plan, unit);
+    final png = await renderPng(plan, unit, furniture: furnitureOnPlan(scan, plan));
     final labels = openingLabels(plan.openings);
     final fronts = <Uint8List>[
       for (var k = 0; k < plan.openings.length; k++)
@@ -405,13 +485,13 @@ class PlanExporter {
             style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
         pw.SizedBox(height: 4),
         pw.Text(
-            '${rooms.length} rooms · total floor area ${formatArea(totalArea(rooms), unit)}',
+            '${rooms.length} room${rooms.length == 1 ? '' : 's'} · total floor area ${formatArea(totalArea(rooms), unit)}',
             style: const pw.TextStyle(fontSize: 10, color: PdfColors.grey700)),
         pw.SizedBox(height: 12),
         pw.Image(pw.MemoryImage(png)),
         pw.SizedBox(height: 14),
         pw.TableHelper.fromTextArray(
-          headers: ['Room', 'Area', 'Size', 'Height', 'Doors', 'Windows'],
+          headers: ['Room', 'Area', 'Size', 'Doors', 'Windows'],
           data: [
             for (final r in rooms)
               [
@@ -419,11 +499,10 @@ class PlanExporter {
                 formatArea(r.plan.area, unit),
                 '${formatLength(r.plan.overallSize.width, unit)} × '
                     '${formatLength(r.plan.overallSize.depth, unit)}',
-                r.plan.height != null ? formatLength(r.plan.height!, unit) : '-',
                 '${count(r, OpeningType.door)}',
                 '${count(r, OpeningType.window)}',
               ],
-            ['Total', formatArea(totalArea(rooms), unit), '', '', '', ''],
+            ['Total', formatArea(totalArea(rooms), unit), '', '', ''],
           ],
           cellStyle: cell,
           headerStyle: bold,

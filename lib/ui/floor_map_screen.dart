@@ -11,6 +11,9 @@ import '../engine/units.dart';
 import '../services/app_settings.dart';
 import '../services/plan_exporter.dart';
 import '../services/scan_store.dart';
+import '../scanner/cad_export.dart';
+import '../scanner/room_model_3d.dart';
+import '../scanner/scanner_3d_screen.dart';
 import 'app_theme.dart';
 import 'common.dart';
 import 'floor_map_painter.dart';
@@ -157,6 +160,7 @@ class _FloorMapScreenState extends State<FloorMapScreen> {
     map.rooms.add(MapRoom(
         scanId: picked.id, offset: offsetForNewRoom(rooms, plan)));
     await _save();
+    if (!mounted) return;
     setState(() => selected = rooms.length - 1);
     if (mounted && rooms.length > 1) {
       showMessage(context, 'Drag the room into place. It snaps to the others.');
@@ -189,14 +193,29 @@ class _FloorMapScreenState extends State<FloorMapScreen> {
       switch (kind) {
         case 'png':
           final f = await PlanExporter.saveMapPng(map, rooms, unit);
-          if (mounted) showMessage(context, 'Image saved to ${f.path}');
+          if (mounted) await deliverFile(context, f, what: 'Image');
         case 'pdf':
           final f = await PlanExporter.saveMapPdf(map, rooms, unit);
-          if (mounted) showMessage(context, 'PDF saved to ${f.path}');
+          if (mounted) await deliverFile(context, f, what: 'PDF');
         case 'share':
           final bytes = await PlanExporter.buildMapPdf(map, rooms, unit);
           await Printing.sharePdf(
               bytes: bytes, filename: '${PlanExporter.safeName(map.name)}.pdf');
+        case 'csv':
+          final f = await PlanExporter.saveCsv(
+              [for (final r in rooms) (r.scan, r.plan)], unit,
+              name: map.name);
+          if (mounted) await deliverFile(context, f, what: 'Spreadsheet (CSV)');
+        case 'dxf':
+          final f = await CadExporter.saveDxf(
+              [for (final r in rooms) RoomInput.placed(r)], unit,
+              name: map.name);
+          if (mounted) await deliverFile(context, f, what: 'CAD drawing (DXF)');
+        case 'obj':
+          final files = await CadExporter.saveObj(
+              RoomModel3D.build([for (final r in rooms) RoomInput.placed(r)]),
+              name: map.name);
+          if (mounted) await deliverFiles(context, files, what: '3D model (OBJ)');
       }
     } catch (e) {
       if (mounted) showMessage(context, 'Export failed: $e');
@@ -343,9 +362,11 @@ class _FloorMapScreenState extends State<FloorMapScreen> {
           const SizedBox(height: 6),
           Text(
             [
-              if (r.plan.height != null)
-                'height ${formatLength(r.plan.height!, unit)}',
-              '${r.plan.openings.length} doors/windows',
+              for (final t in [OpeningType.door, OpeningType.window])
+                () {
+                  final k = r.plan.openings.where((o) => o.type == t).length;
+                  return '$k ${t.label.toLowerCase()}${k == 1 ? '' : 's'}';
+                }(),
             ].join('  ·  '),
             style: theme.textTheme.bodySmall?.copyWith(
                 color: cs.onSurfaceVariant, fontFeatures: AppTheme.tabular),
@@ -463,7 +484,19 @@ class _FloorMapScreenState extends State<FloorMapScreen> {
             ),
           ),
           actions: [
-            const UnitButton(),
+            const UnitButton(compact: true),
+            IconButton(
+              tooltip: '3D view',
+              icon: const Icon(Icons.view_in_ar_rounded),
+              onPressed: rooms.isEmpty
+                  ? null
+                  : () => Navigator.push(
+                      context,
+                      MaterialPageRoute<void>(
+                          builder: (_) => Scanner3DScreen(
+                              rooms: [for (final r in rooms) RoomInput.placed(r)],
+                              title: map.name))),
+            ),
             PopupMenuButton<String>(
               tooltip: 'Export',
               icon: const Icon(Icons.ios_share_rounded),
@@ -486,6 +519,21 @@ class _FloorMapScreenState extends State<FloorMapScreen> {
                     child: ListTile(
                         leading: Icon(Icons.image_outlined),
                         title: Text('Save image'))),
+                const PopupMenuItem(
+                    value: 'csv',
+                    child: ListTile(
+                        leading: Icon(Icons.table_chart_outlined),
+                        title: Text('Spreadsheet (CSV)'))),
+                const PopupMenuItem(
+                    value: 'dxf',
+                    child: ListTile(
+                        leading: Icon(Icons.architecture_outlined),
+                        title: Text('CAD drawing (DXF)'))),
+                const PopupMenuItem(
+                    value: 'obj',
+                    child: ListTile(
+                        leading: Icon(Icons.view_in_ar_outlined),
+                        title: Text('3D model (OBJ)'))),
               ],
             ),
             PopupMenuButton<String>(

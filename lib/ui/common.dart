@@ -1,9 +1,42 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../engine/models.dart';
 import '../engine/units.dart';
 import '../services/app_settings.dart';
+import '../services/laser_meter.dart';
+import 'laser_sheet.dart';
+
+/// Hands a file the app made (PDF, image) to the user. On a phone it was
+/// written to the app's private folder, which no file manager can open, so
+/// the system share sheet comes up (Save to Files / Drive, mail, chat...).
+/// On a computer the file stays in the exports folder and its path is shown.
+Future<void> deliverFile(BuildContext context, File f, {required String what}) =>
+    deliverFiles(context, [f], what: what);
+
+/// [deliverFile] for files that belong together (a 3D model and its
+/// materials): shared in one go; on a computer the first one's path is shown.
+Future<void> deliverFiles(BuildContext context, List<File> files,
+    {required String what}) async {
+  final f = files.first;
+  if (Platform.isAndroid || Platform.isIOS) {
+    final box = context.findRenderObject() as RenderBox?;
+    await SharePlus.instance.share(ShareParams(
+      files: [for (final f in files) XFile(f.path)],
+      title: what,
+      subject: what,
+      sharePositionOrigin:
+          box == null ? null : box.localToGlobal(Offset.zero) & box.size,
+    ));
+    return;
+  }
+  if (context.mounted) showMessage(context, '$what saved to ${f.path}');
+}
 
 /// Asks for a name. Returns null when cancelled.
 ///
@@ -54,13 +87,19 @@ Future<String?> askText(
 /// say what each one is, e.g. "Window · 1.20 × 1.10 m"). Every name is
 /// mandatory: Save stays off until all are typed, and the dialog cannot be
 /// closed without them. Returns the names in the order of [labels].
+/// [initial] pre-fills boxes (e.g. the room last used); missing ones start
+/// empty.
 Future<List<String>> askNames(
   BuildContext context, {
   required String title,
   required List<String> labels,
+  List<String> initial = const [],
   String confirm = 'Save',
 }) async {
-  final cs = [for (final _ in labels) TextEditingController()];
+  final cs = [
+    for (var i = 0; i < labels.length; i++)
+      TextEditingController(text: i < initial.length ? initial[i] : ''),
+  ];
   final touched = List.filled(labels.length, false);
   final result = await showDialog<List<String>>(
     context: context,
@@ -152,10 +191,47 @@ class _LengthFieldState extends State<LengthField> {
   final _focus = FocusNode();
   OverlayEntry? _doneBar;
 
+  /// Laser meter: the laser button was tapped, so the next distance
+  /// measured goes into this box even when it has no focus.
+  bool _armed = false;
+  StreamSubscription<double>? _laser;
+
   @override
   void initState() {
     super.initState();
     _focus.addListener(_onFocusChange);
+    if (laserAvailable) _laser = LaserMeter.instance.readings.listen(_onLaser);
+  }
+
+  /// A distance from the laser: into this box when it is selected (or its
+  /// laser button was tapped), then on to the next box, so a room can be
+  /// measured wall after wall without touching the phone.
+  void _onLaser(double metres) {
+    if (!mounted || !(_armed || _focus.hasFocus)) return;
+    final text = editableLength(metres, widget.unit);
+    widget.controller.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+    widget.onChanged?.call(text);
+    HapticFeedback.mediumImpact();
+    final wasFocused = _focus.hasFocus;
+    setState(() => _armed = false);
+    if (wasFocused) _focus.nextFocus();
+  }
+
+  Future<void> _laserTapped() async {
+    if (!LaserMeter.instance.connected) {
+      final ok = await showLaserSheet(context);
+      if (!ok || !mounted) return;
+    }
+    setState(() => _armed = !_armed);
+    if (_armed && mounted) {
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(
+        duration: const Duration(seconds: 3),
+        content: Text('Press measure on the laser for "${widget.label}"'),
+      ));
+    }
   }
 
   void _onFocusChange() {
@@ -181,6 +257,7 @@ class _LengthFieldState extends State<LengthField> {
 
   @override
   void dispose() {
+    _laser?.cancel();
     _focus.removeListener(_onFocusChange);
     _hideDoneBar();
     _focus.dispose();
@@ -199,12 +276,30 @@ class _LengthFieldState extends State<LengthField> {
           ? TextInputType.text
           : const TextInputType.numberWithOptions(decimal: true),
       textInputAction: TextInputAction.done,
+      // Straight ' and " for feet and inches, not curly quotes.
+      smartQuotesType: SmartQuotesType.disabled,
+      smartDashesType: SmartDashesType.disabled,
+      autocorrect: false,
+      enableSuggestions: false,
       decoration: InputDecoration(
         labelText: widget.label,
         hintText: unit.inputHint,
         helperText: widget.helper,
         helperMaxLines: 3,
         suffixText: unit == LengthUnit.feetInches ? null : unit.label,
+        // Measure with the Bluetooth laser (highlighted while waiting for it).
+        suffixIcon: laserAvailable
+            ? ListenableBuilder(
+                listenable: LaserMeter.instance,
+                builder: (context, _) => IconButton(
+                  tooltip: 'Measure with laser',
+                  isSelected: _armed,
+                  color: LaserMeter.instance.connected ? Theme.of(context).colorScheme.primary : null,
+                  icon: Icon(_armed ? Icons.sensors_rounded : Icons.sensors_outlined),
+                  onPressed: _laserTapped,
+                ),
+              )
+            : null,
       ),
       validator: (v) => LengthField.validate(v ?? '', unit,
           optional: widget.optional, allowZero: widget.allowZero),
@@ -334,7 +429,11 @@ void showMessage(BuildContext context, String msg) {
 
 /// App-bar button that switches the display unit everywhere.
 class UnitButton extends StatelessWidget {
-  const UnitButton({super.key});
+  const UnitButton({super.key, this.compact = false});
+
+  /// Just the unit, no chip: for title bars that also show a long name
+  /// (the chip squeezed a room's name down to a few letters).
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
@@ -355,6 +454,17 @@ class UnitButton extends StatelessWidget {
         child: Builder(builder: (context) {
           final theme = Theme.of(context);
           final cs = theme.colorScheme;
+          if (compact) {
+            return Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 12),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.straighten_rounded, size: 18, color: cs.primary),
+                const SizedBox(width: 3),
+                Text(unit.label,
+                    style: theme.textTheme.labelLarge?.copyWith(color: cs.onSurface)),
+              ]),
+            );
+          }
           return Container(
             margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 10),
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),

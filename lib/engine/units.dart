@@ -74,7 +74,14 @@ String formatVolume(double cubicMetres, LengthUnit unit) {
 /// Feet & inches accepts `12.5`, `12' 6"`, `12'6`, `12 6` or `12ft 6in`.
 /// Any unit also accepts an explicit suffix: `3.2 m`, `320 cm`, `126 in`.
 double? parseLength(String input, LengthUnit unit) {
-  final s = input.trim().replaceAll(',', '.').toLowerCase();
+  // Typographic quotes and primes (iOS turns ' and " into ’ and ” as you
+  // type) mean feet and inches too.
+  final s = input
+      .trim()
+      .replaceAll(',', '.')
+      .replaceAll(RegExp('[‘’′]'), "'")
+      .replaceAll(RegExp('[“”″]'), '"')
+      .toLowerCase();
   if (s.isEmpty) return null;
 
   double? positive(double? v) => (v == null || v <= 0 || v.isNaN) ? null : v;

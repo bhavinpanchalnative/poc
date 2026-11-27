@@ -27,6 +27,7 @@ class OpeningEditorScreen extends StatefulWidget {
     required this.plan,
     required this.opening,
     required this.label,
+    this.roomName = '',
   });
 
   final FloorPlan plan;
@@ -34,6 +35,9 @@ class OpeningEditorScreen extends StatefulWidget {
 
   /// E.g. "D1" or "W2", as listed in the room.
   final String label;
+
+  /// The room the door / window is in, shown with it.
+  final String roomName;
 
   @override
   State<OpeningEditorScreen> createState() => _OpeningEditorScreenState();
@@ -43,7 +47,20 @@ class _OpeningEditorScreenState extends State<OpeningEditorScreen> {
   late Opening opening = widget.opening;
   late OpeningElevation e = OpeningElevation.of(widget.plan, opening);
   OpeningEdge? _drag;
+
+  /// Held edge minus the finger's position when grabbed (metres).
+  double _dragOffset = 0;
   bool _changed = false;
+
+  static bool _horizontal(OpeningEdge edge) =>
+      edge == OpeningEdge.left || edge == OpeningEdge.right;
+
+  double _edgeValue(OpeningEdge edge) => switch (edge) {
+        OpeningEdge.left => e.left,
+        OpeningEdge.right => e.right,
+        OpeningEdge.top => e.head,
+        OpeningEdge.bottom => e.sill,
+      };
 
   final _width = TextEditingController();
   final _height = TextEditingController();
@@ -66,11 +83,23 @@ class _OpeningEditorScreenState extends State<OpeningEditorScreen> {
     super.dispose();
   }
 
+  /// The text each field was last filled with: leaving a field whose text
+  /// is unchanged must not write anything (that turned a typical, assumed
+  /// height into a "measured" one, and rounded values to the unit).
+  final _filled = <TextEditingController, String>{};
+
+  /// A size was dragged or typed: the saved size is the user's, no longer
+  /// the scanner's estimate.
+  bool _sizeEdited = false;
+
   void _fillFields() {
     _width.text = editableLength(e.width, unit);
     _height.text = editableLength(e.height, unit);
     _sill.text = editableLength(e.sill, unit);
     _left.text = editableLength(e.left, unit);
+    for (final c in [_width, _height, _sill, _left]) {
+      _filled[c] = c.text;
+    }
   }
 
   void _set(OpeningElevation next, {bool fields = true}) {
@@ -85,20 +114,24 @@ class _OpeningEditorScreenState extends State<OpeningEditorScreen> {
   double _snap(double m) => (m * 100).roundToDouble() / 100;
 
   void _applyField(TextEditingController c, OpeningEdge? edge) {
-    final v = parseLength(c.text, unit);
-    if (v == null || v.isNaN || v < 0) {
+    if (c.text.trim() == (_filled[c] ?? '').trim()) return;
+    // 0 is a real value for the sill and the distance from the corner.
+    final v = LengthField.isZero(c.text) ? 0.0 : parseLength(c.text, unit);
+    if (v == null || v.isNaN || v < 0 || (v == 0 && (c == _width || c == _height))) {
       _fillFields();
       return;
     }
     switch (c) {
       case final x when x == _width:
+        _sizeEdited = true;
         _set(e.withEdge(OpeningEdge.right, e.left + v));
       case final x when x == _height:
+        _sizeEdited = true;
         _set(e.withEdge(OpeningEdge.top, e.sill + v));
       case final x when x == _sill:
         // Moving the sill keeps the window's height.
         final h = e.height;
-        _set(e.copyWith(sill: v.clamp(0.0, e.wallHeight - h)));
+        _set(e.copyWith(sill: v.clamp(0.0, OpeningElevation.maxHead - h)));
       case final x when x == _left:
         _set(e.copyWith(left: v.clamp(0.0, e.wallLength - e.width)));
     }
@@ -106,18 +139,17 @@ class _OpeningEditorScreenState extends State<OpeningEditorScreen> {
 
   void _setType(OpeningType t) {
     if (t == opening.type) return;
-    opening = opening.copyWith(
-      type: t,
-      // A window needs a sill; a door stands on the floor.
-      sill: t == OpeningType.window ? OpeningElevation.typicalSill : null,
-      clearSill: t != OpeningType.window,
-      clearHeight: true,
-    );
+    // From what is on screen now (edits so far kept, height kept). A door
+    // has no sill; a window's sill, not measured, shows as typical.
+    final now = e.toOpening(opening);
+    opening = now.copyWith(type: t, clearSill: true);
     _set(OpeningElevation.of(widget.plan, opening));
   }
 
   void _save() {
-    Navigator.pop(context, OpeningEdit.save(e.toOpening(opening)));
+    final o = e.toOpening(opening);
+    Navigator.pop(context,
+        OpeningEdit.save(_sizeEdited ? o.copyWith(estimated: false) : o));
   }
 
   Future<void> _delete() async {
@@ -153,16 +185,23 @@ class _OpeningEditorScreenState extends State<OpeningEditorScreen> {
                 best = edge;
               }
             }
+            // The edge keeps its distance to the finger: it moves with the
+            // finger from here instead of jumping onto it.
+            if (best != null) {
+              final p = d.localPosition;
+              _dragOffset = _horizontal(best)
+                  ? _edgeValue(best) - l.toWallX(p.dx)
+                  : _edgeValue(best) - l.toWallY(p.dy);
+            }
             setState(() => _drag = best);
           },
           onPanUpdate: (d) {
             final edge = _drag;
             if (edge == null) return;
             final p = d.localPosition;
-            final v = edge == OpeningEdge.left || edge == OpeningEdge.right
-                ? l.toWallX(p.dx)
-                : l.toWallY(p.dy);
-            _set(e.withEdge(edge, _snap(v)));
+            final v = _horizontal(edge) ? l.toWallX(p.dx) : l.toWallY(p.dy);
+            _sizeEdited = true;
+            _set(e.withEdge(edge, _snap(v + _dragOffset)));
           },
           onPanEnd: (_) => setState(() => _drag = null),
           child: CustomPaint(
@@ -206,7 +245,6 @@ class _OpeningEditorScreenState extends State<OpeningEditorScreen> {
       if (e.estimated) 'size estimated: check with a tape',
       if (e.heightAssumed) 'height not measured (typical shown)',
       if (e.sillAssumed) 'sill not measured (typical shown)',
-      if (e.wallHeightAssumed) 'ceiling height not measured',
     ];
     final cs = theme.colorScheme;
     final accent = switch (o.type) {
@@ -247,7 +285,11 @@ class _OpeningEditorScreenState extends State<OpeningEditorScreen> {
                 children: [
                   Text(widget.label, overflow: TextOverflow.ellipsis),
                   Text(
-                    '${o.type.label} on wall W${e.wallIndex + 1}',
+                    [
+                      if (widget.roomName.trim().isNotEmpty) widget.roomName.trim(),
+                      '${o.type.label} on wall W${e.wallIndex + 1}',
+                    ].join('  ·  '),
+                    key: const Key('opening-room'),
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.labelMedium
                         ?.copyWith(color: cs.onSurfaceVariant),

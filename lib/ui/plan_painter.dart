@@ -58,7 +58,18 @@ class PlanPainter extends CustomPainter {
     this.handles = false,
     this.highlightLine,
     this.zoom = 1.0,
+    this.photoPins = const [],
+    this.furniture = const [],
   });
+
+  /// Furniture on the plan: (centre, direction of its width in radians,
+  /// width, depth, name), in plan coordinates.
+  final List<(Vec2, double, double, double, String)> furniture;
+
+  /// Where photos were taken: (position, look direction) in plan
+  /// coordinates, the photo's number (its place in the room's photos), and
+  /// whether it is a 360° photo.
+  final List<(Vec2, Vec2?, int, bool)> photoPins;
 
   final FloorPlan plan;
   final LengthUnit unit;
@@ -120,6 +131,7 @@ class PlanPainter extends CustomPainter {
     for (final m in plan.surfaces) {
       if (m.kind != SurfaceKind.wall) _drawAreaSurface(canvas, m);
     }
+    if (!editing) _drawFurniture(canvas);
 
     // Walls
     final wallPx = math.max(5.0, 0.12 * s);
@@ -139,6 +151,27 @@ class PlanPainter extends CustomPainter {
             ..strokeCap = StrokeCap.square);
     }
 
+    // Labels drawn later that opening labels must keep clear of: the area
+    // in the middle and each wall's number tag.
+    _taken.clear();
+    _taken.add(Rect.fromCenter(
+        center: _p(polygonCentroid(pts)),
+        width: _measure(formatArea(plan.area, unit), 15).width + 8,
+        height: 24));
+    for (var i = 0; i < plan.wallCount; i++) {
+      final n = _d(plan.outwardNormal(i));
+      final tag = (_p(plan.wallStart(i)) + _p(plan.wallEnd(i))) / 2 - n * (wallPx / 2 + 12);
+      _taken.add(Rect.fromCenter(
+          center: tag, width: _measure('W${i + 1}', 10).width, height: 14));
+      // The wall's length, outside it (as _drawDimension places it).
+      final a = _p(plan.wallStart(i)), b = _p(plan.wallEnd(i));
+      final d = b - a;
+      if (d.distance > 0) {
+        _taken.add(_labelRect((a + b) / 2 + n * (wallPx / 2 + 25), d / d.distance,
+            _measure(formatLength(plan.wallLength(i), unit), 12)));
+      }
+    }
+    _floor = [for (final c in pts) _p(c)];
     for (final o in plan.openings) {
       _drawOpening(canvas, o, wallPx);
     }
@@ -153,17 +186,73 @@ class PlanPainter extends CustomPainter {
     }
     if (!editing) _drawCornerAngles(canvas, wallPx);
 
-    // Area and height in the middle of the room
+    // Area in the middle of the room
     final c = _p(polygonCentroid(pts));
     _text(canvas, formatArea(plan.area, unit), c,
-        size: 15, weight: FontWeight.w700);
-    if (plan.height != null) {
-      _text(canvas, 'Ceiling ${formatLength(plan.height!, unit)}',
-          c + const Offset(0, 20),
-          size: 11, color: quiet);
-    }
+        size: 15, weight: FontWeight.w700, background: true);
+    if (!editing) _drawPhotoPins(canvas);
     if (handles || editing) _drawHandles(canvas);
     if (!editing) _drawScaleBar(canvas, size);
+  }
+
+  /// Furniture found by the scanner: its footprint, and its name when it
+  /// fits.
+  void _drawFurniture(Canvas canvas) {
+    final fill = Paint()..color = ink.withValues(alpha: 0.06);
+    final edge = Paint()
+      ..color = ink.withValues(alpha: 0.45)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2;
+    for (final f in furniture) {
+      final (c, angle, w, d, name) = f;
+      final u = Vec2(math.cos(angle), math.sin(angle)) * (w / 2);
+      final v = Vec2(-math.sin(angle), math.cos(angle)) * (d / 2);
+      final rect = Path()
+        ..addPolygon([_p(c - u - v), _p(c + u - v), _p(c + u + v), _p(c - u + v)], true);
+      canvas.drawPath(rect, fill);
+      canvas.drawPath(rect, edge);
+      final px = math.min(w, d) * _l.scale;
+      if (px >= 22) {
+        _text(canvas, name, _p(c), size: px >= 40 ? 11 : 9, color: ink.withValues(alpha: 0.7));
+      }
+    }
+  }
+
+  /// Where the photos were taken (LiDAR scans): a numbered marker each (its
+  /// number in the room's photos), with a short wedge the way the camera
+  /// looked.
+  void _drawPhotoPins(Canvas canvas) {
+    for (final pin in photoPins) {
+      final at = _p(pin.$1);
+      final dir = pin.$2;
+      if (dir != null && dir.length > 0.1) {
+        final d = _d(dir.normalized);
+        final side = Offset(-d.dy, d.dx);
+        final wedge = Path()
+          ..moveTo(at.dx, at.dy)
+          ..lineTo(at.dx + d.dx * 26 + side.dx * 11, at.dy + d.dy * 26 + side.dy * 11)
+          ..lineTo(at.dx + d.dx * 26 - side.dx * 11, at.dy + d.dy * 26 - side.dy * 11)
+          ..close();
+        canvas.drawPath(wedge, Paint()..color = accent.withValues(alpha: 0.25));
+      }
+      if (pin.$4) {
+        // 360° photo: a wider marker with a ring round it, labelled "360".
+        canvas.drawCircle(
+            at,
+            17,
+            Paint()
+              ..color = accent
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 2);
+        canvas.drawCircle(at, 14, Paint()..color = paper);
+        canvas.drawCircle(at, 12.5, Paint()..color = accent);
+        _text(canvas, '360', at, size: 9, weight: FontWeight.w700, color: paper);
+        continue;
+      }
+      canvas.drawCircle(at, 10, Paint()..color = paper);
+      canvas.drawCircle(at, 8.5, Paint()..color = accent);
+      _text(canvas, '${pin.$3}', at, size: 10, weight: FontWeight.w700, color: paper);
+    }
   }
 
   void _drawGrid(Canvas canvas, Size size) {
@@ -241,12 +330,80 @@ class PlanPainter extends CustomPainter {
       if (o.sill != null) 'sill ${_short(o.sill!)}',
     ].join('  ·  ');
     final color = o.type == OpeningType.window ? windowColor : doorColor;
-    // Further in than the wall's number tag (W1, W2…), which sits at the
-    // middle of the wall too.
-    var at = _p((s + e) / 2) + _d(inward) * (wallPx / 2 + 28);
-    // Doors: beyond the swing arc rather than on top of it.
-    if (o.type == OpeningType.door) at += _d(inward) * (width * _l.scale);
+    final size = _measure(label, 10);
+    final mid = _p((s + e) / 2);
+    final along = _d(dir) / _d(dir).distance;
+    final inn = _d(inward) / _d(inward).distance;
+    final tagHalf = _measure('W${o.wallIndex + 1}', 10).width / 2;
+    // Where it may go, best first: further in than the wall's number tag
+    // (doors: beyond the swing arc), else just past the tag, else beside
+    // the tag along the wall. The first that hits no other label (the
+    // room's area, wall tags, other openings) is used: in a small room the
+    // spot beyond a door's arc is right on the area in the middle.
+    final first = mid +
+        inn * (wallPx / 2 + 28) +
+        (o.type == OpeningType.door ? inn * (width * _l.scale) : Offset.zero);
+    final candidates = [
+      first,
+      mid + inn * (wallPx / 2 + 28),
+      for (final side in [1.0, -1.0])
+        mid + inn * (wallPx / 2 + 12) + along * side * (tagHalf + size.width / 2 + 8),
+      // Cramped rooms: part way towards the middle of the room.
+      for (final f in [0.35, 0.6])
+        Offset.lerp(mid, _p(polygonCentroid(plan.corners)), f)! + const Offset(0, 22),
+    ];
+    var at = first;
+    for (final c in candidates) {
+      if (!_collides(_labelRect(c, along, size))) {
+        at = c;
+        break;
+      }
+    }
+    _taken.add(_labelRect(at, along, size));
     _textAlong(canvas, label, at, _d(dir), color: color);
+  }
+
+  /// Labels already on the drawing (screen rects), so opening labels don't
+  /// land on them.
+  final _taken = <Rect>[];
+
+  /// The room's outline on screen: labels for openings go inside it.
+  List<Offset> _floor = const [];
+
+  bool _collides(Rect r) =>
+      _taken.any((t) => t.overlaps(r)) || !_inside(r.center);
+
+  bool _inside(Offset q) {
+    var inside = false;
+    for (var i = 0, j = _floor.length - 1; i < _floor.length; j = i++) {
+      final a = _floor[i], b = _floor[j];
+      if ((a.dy > q.dy) != (b.dy > q.dy) &&
+          q.dx < (b.dx - a.dx) * (q.dy - a.dy) / (b.dy - a.dy) + a.dx) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  Size _measure(String s, double size) {
+    final tp = TextPainter(
+      text: TextSpan(
+          text: s,
+          style: TextStyle(
+              fontFamily: 'Inter',
+              fontSize: size,
+              fontFeatures: const [FontFeature.tabularFigures()])),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    return Size(tp.width + 6, tp.height + 2);
+  }
+
+  /// Screen bounding box of a label of [size] centred at [at], running
+  /// along unit vector [along].
+  Rect _labelRect(Offset at, Offset along, Size size) {
+    final w = (along.dx * size.width).abs() + (along.dy * size.height).abs();
+    final h = (along.dy * size.width).abs() + (along.dx * size.height).abs();
+    return Rect.fromCenter(center: at, width: w, height: h);
   }
 
   /// A small label running parallel to [dir] (kept upright), so labels by
@@ -468,7 +625,8 @@ class PlanPainter extends CustomPainter {
       old.editing != editing ||
       old.handles != handles ||
       old.highlightLine != highlightLine ||
-      old.zoom != zoom;
+      old.zoom != zoom ||
+      old.photoPins != photoPins;
 }
 
 /// A small outline of a room for lists.
@@ -499,3 +657,17 @@ class PlanThumbnailPainter extends CustomPainter {
   bool shouldRepaint(PlanThumbnailPainter old) =>
       old.plan != plan || old.fill != fill || old.stroke != stroke;
 }
+
+/// A room's furniture ([RoomScan.elements] with a place and size) in
+/// [plan]'s coordinates, for [PlanPainter.furniture].
+List<(Vec2, double, double, double, String)> furnitureOnPlan(RoomScan scan, FloorPlan plan) => [
+      for (final e in scan.elements)
+        if (e.position != null && e.width != null && e.depth != null)
+          (
+            plan.toPlan(e.position!),
+            (e.angle ?? 0) - plan.rotation,
+            e.width! * plan.scale,
+            e.depth! * plan.scale,
+            e.kind,
+          ),
+    ];

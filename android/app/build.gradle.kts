@@ -6,8 +6,15 @@ plugins {
 
 android {
     namespace = "com.nativesoftware.room_measure"
-    compileSdk = flutter.compileSdkVersion
+    // 37: flutter_reactive_ble (laser meters) is built against it. Only what the
+    // app compiles against; minSdk / targetSdk (which phones, and how) are unchanged.
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
+
+    // The furniture detector's model is memory-mapped: keep it uncompressed.
+    androidResources {
+        noCompress += "tflite"
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -55,5 +62,7 @@ flutter {
 dependencies {
     // ARCore, used directly by ArMeasureActivity for camera measuring.
     implementation("com.google.ar:core:1.40.0")
+    // MediaPipe Object Detector: on-device AI furniture detection (Apache 2.0).
+    implementation("com.google.mediapipe:tasks-vision:1.2.3")
     testImplementation("junit:junit:4.13.2")
 }

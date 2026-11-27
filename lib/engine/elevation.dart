@@ -19,7 +19,6 @@ class OpeningElevation {
     required this.width,
     required this.height,
     required this.sill,
-    this.wallHeightAssumed = false,
     this.heightAssumed = false,
     this.sillAssumed = false,
     this.estimated = false,
@@ -47,7 +46,6 @@ class OpeningElevation {
       width: width,
       height: h,
       sill: s,
-      wallHeightAssumed: true,
       heightAssumed: height == null,
       sillAssumed: type == OpeningType.window && sill == null,
       estimated: estimated,
@@ -62,7 +60,12 @@ class OpeningElevation {
     final width = math.min(o.width, len);
     final h = o.height ?? o.type.typicalHeight;
     final sill = o.type == OpeningType.window ? (o.sill ?? typicalSill) : 0.0;
-    final wallH = plan.height ?? math.max(defaultWallHeight, sill + h + 0.2);
+    // The wall's real height when the scan measured it (LiDAR); otherwise
+    // a backdrop with room above the opening to drag its top edge up.
+    final ceiling = plan.ceilingHeight;
+    final wallH = ceiling != null
+        ? math.max(ceiling, sill + h)
+        : math.max(defaultWallHeight, sill + h + 0.4);
     return OpeningElevation(
       type: o.type,
       wallIndex: i,
@@ -72,7 +75,6 @@ class OpeningElevation {
       width: width,
       height: h,
       sill: sill,
-      wallHeightAssumed: plan.height == null,
       heightAssumed: o.height == null,
       sillAssumed: o.type == OpeningType.window && o.sill == null,
       estimated: o.estimated,
@@ -80,6 +82,9 @@ class OpeningElevation {
   }
 
   static const defaultWallHeight = 2.5;
+
+  /// Highest an opening's top may go (m).
+  static const maxHead = 4.0;
   static const typicalSill = 0.9;
 
   /// Smallest size an edit may leave.
@@ -96,7 +101,7 @@ class OpeningElevation {
   /// Bottom edge above the floor (0 for doors).
   final double sill;
 
-  final bool wallHeightAssumed, heightAssumed, sillAssumed, estimated;
+  final bool heightAssumed, sillAssumed, estimated;
 
   /// No room around it: the wall is only a backdrop and is not dimensioned.
   final bool standalone;
@@ -121,12 +126,14 @@ class OpeningElevation {
         type: type,
         wallIndex: wallIndex,
         wallLength: wallLength,
-        wallHeight: wallHeight,
+        // No ceiling is measured: the wall behind is only a backdrop; it
+        // grows to fit a taller opening rather than limiting it.
+        wallHeight: math.max(
+            wallHeight, (sill ?? this.sill) + (height ?? this.height) + 0.1),
         left: left ?? this.left,
         width: width ?? this.width,
         height: height ?? this.height,
         sill: sill ?? this.sill,
-        wallHeightAssumed: wallHeightAssumed,
         heightAssumed: height == null && heightAssumed,
         sillAssumed: sill == null && sillAssumed,
         estimated: estimated,
@@ -144,7 +151,7 @@ class OpeningElevation {
         final r = value.clamp(left + minSize, wallLength);
         return copyWith(width: r - left);
       case OpeningEdge.top:
-        final t = value.clamp(sill + minSize, wallHeight);
+        final t = value.clamp(sill + minSize, maxHead);
         return copyWith(height: t - sill);
       case OpeningEdge.bottom:
         // A door stands on the floor.

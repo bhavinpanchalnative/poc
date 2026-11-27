@@ -236,6 +236,97 @@ class OpeningDetectorTest {
         assertTrue(!s2.stable)
     }
 
+    // ------------------------------------------------ room scan (wide search)
+
+    private fun search(kind: OpeningKind, v: View): OpeningCandidate? {
+        val img = OpeningDetector.rectify(v.frame, v.camera, ByteLuminance(v.image, imgW, imgH))
+        return OpeningDetector.search(kind, v.frame, img).candidate
+    }
+
+    /**
+     * Scanning a room, the camera is aimed low (at corners, where the wall
+     * meets the floor): the crosshair is below the window's sill. Looking
+     * only around the crosshair's height finds nothing; the room-scan search
+     * finds the window at its true size.
+     */
+    @Test
+    fun roomScanFindsWindowAboveTheCrosshair() {
+        for ((d, pitch) in listOf(2.5f to -15f, 3.0f to -12f)) {
+            val (view, _) = render(Scene.WINDOW, 1.20f, 0.90f, 2.00f, d, 10f, pitch, true)
+            assertTrue("crosshair below the sill", view.frame.origin.y < 0.9f)
+            assertNull("aimed below the sill (old behaviour)", detect(OpeningKind.WINDOW, view))
+            val c = search(OpeningKind.WINDOW, view)
+            assertNotNull("window d=$d pitch=$pitch not found by the room-scan search", c)
+            c!!
+            assertEquals(1.20f, c.width, TOL)
+            assertEquals(1.10f, c.height, TOL)
+            assertEquals(0.90f, c.sill!!, TOL)
+            assertTrue(RoomOpeningCounter.plausible(OpeningKind.WINDOW, c, 0f))
+        }
+    }
+
+    /** The crosshair passes beside a door, not over it. */
+    @Test
+    fun roomScanFindsDoorBesideTheCrosshair() {
+        for (off in listOf(0.75f, -0.75f)) {
+            val (view, o) = render(Scene.DOOR, 0.82f, 0f, 2.03f, 2.8f, 5f, -5f, true, offsetU = off)
+            assertNull("crosshair beside the door (old behaviour)", detect(OpeningKind.DOOR, view))
+            val c = search(OpeningKind.DOOR, view)
+            assertNotNull("door offset $off not found", c)
+            c!!
+            assertEquals(0.82f, c.width, TOL)
+            assertEquals(2.03f, c.height, TOL)
+            assertEquals(o.left, wallU(c.a), TOL)
+            assertTrue(RoomOpeningCounter.plausible(OpeningKind.DOOR, c, 0f))
+        }
+    }
+
+    /** Searching wider must not invent doors or windows on a plain wall. */
+    @Test
+    fun roomScanSearchFindsNothingOnPlainWall() {
+        for ((d, yaw, pitch) in listOf(Triple(2.4f, 10f, 0f), Triple(2.0f, 0f, -10f), Triple(2.8f, 25f, -15f))) {
+            val (view, _) = render(Scene.PLAIN, 0.82f, 0f, 2.03f, d, yaw, pitch, true, seed = 7)
+            assertNull("door on plain wall d=$d yaw=$yaw", search(OpeningKind.DOOR, view))
+            assertNull("window on plain wall d=$d yaw=$yaw", search(OpeningKind.WINDOW, view))
+        }
+    }
+
+    /** A window must not also be counted as a door (or a door as a window). */
+    @Test
+    fun roomScanKeepsDoorsAndWindowsApart() {
+        val (wv, _) = render(Scene.WINDOW, 1.20f, 0.90f, 2.00f, 2.5f, 10f, -5f, true)
+        val window = search(OpeningKind.WINDOW, wv)!!
+        val doorOnWindow = search(OpeningKind.DOOR, wv)
+        if (doorOnWindow != null) assertTrue(RoomOpeningCounter.doorIsWindow(doorOnWindow, window, 0f))
+
+        val (dv, _) = render(Scene.DOOR, 0.82f, 0f, 2.03f, 2.5f, 10f, -5f, true)
+        val door = search(OpeningKind.DOOR, dv)!!
+        val windowOnDoor = search(OpeningKind.WINDOW, dv)
+        assertTrue(!RoomOpeningCounter.doorIsWindow(door, windowOnDoor, 0f))
+        if (windowOnDoor != null) assertTrue(!RoomOpeningCounter.plausible(OpeningKind.WINDOW, windowOnDoor, 0f))
+    }
+
+    /** Room scan: 3 detections a few cm apart, as when sweeping past, count. */
+    @Test
+    fun roomScanConsensusSettlesWhileSweeping() {
+        fun cand(f: WallFrame, l: Float, r: Float, t: Float) = OpeningCandidate(
+            l, r, 0f, t, f.world(l, 0f), f.world(r, 0f), t, r - l, t, null, 5f, false,
+        )
+        val strict = OpeningConsensus()
+        val room = OpeningConsensus.forRoomScan()
+        val jitter = listOf(0f, 0.025f, -0.02f)
+        var sStrict: OpeningConsensus.State? = null
+        var sRoom: OpeningConsensus.State? = null
+        for ((i, j) in jitter.withIndex()) {
+            val f = WallFrame(Vec3(0.15f * i, 1.2f, 0f), Vec3(0f, 0f, 1f), 0f, false)
+            sStrict = strict.add(f, cand(f, -0.40f + j - 0.15f * i, 0.42f - j - 0.15f * i, 2.03f + j))
+            sRoom = room.add(f, cand(f, -0.40f + j - 0.15f * i, 0.42f - j - 0.15f * i, 2.03f + j))
+        }
+        assertTrue(!sStrict!!.stable)
+        assertTrue(sRoom!!.stable)
+        assertEquals(0.82f, sRoom.candidate.width, 0.03f)
+    }
+
     @Test
     fun pngHasHeader() {
         val img = RectifiedImage(3, 2, 0f, 0f, floatArrayOf(0f, 128f, 255f, Float.NaN, 10f, 20f))

@@ -246,18 +246,25 @@ class RoomScan {
     required this.name,
     required this.createdAt,
     required this.source,
-    required this.walls,
+    required List<WallLine> walls,
     List<Opening>? openings,
     List<MeasuredSurface>? surfaces,
     List<String>? photos,
     List<MeasuredLine>? lines,
-    this.height,
+    List<RoomElement>? elements,
+    List<PhotoPin>? photoPins,
     this.scale = 1.0,
     this.keepOrientation = false,
-  })  : openings = openings ?? [],
-        surfaces = surfaces ?? [],
-        photos = photos ?? [],
-        lines = lines ?? [];
+    this.ceilingHeight,
+  })  // Copied: a caller's list (a const one in the examples) must not be
+      // what edits change, or adding a door to an example threw.
+      : walls = List.of(walls),
+        openings = List.of(openings ?? const []),
+        surfaces = List.of(surfaces ?? const []),
+        photos = List.of(photos ?? const []),
+        lines = List.of(lines ?? const []),
+        elements = List.of(elements ?? const []),
+        photoPins = List.of(photoPins ?? const []);
 
   final String id;
   String name;
@@ -278,8 +285,17 @@ class RoomScan {
   /// Point-to-point distances measured in the room.
   final List<MeasuredLine> lines;
 
-  /// Ceiling height in metres, if measured.
-  double? height;
+  /// Other things found in the room by the scanner (furniture and fixtures
+  /// such as a bed, sofa or sink). Doors and windows are in [openings].
+  final List<RoomElement> elements;
+
+  /// Where photos taken during the scan were taken, in the same coordinates
+  /// as [walls] (LiDAR scans). Each names its file in [photos].
+  final List<PhotoPin> photoPins;
+
+  /// Floor-to-ceiling height (m), when the scanner measured it (LiDAR: from
+  /// the walls' heights). The camera scanner can't, so it stays null.
+  double? ceilingHeight;
 
   /// Correction factor for horizontal sizes, set when the user types the
   /// true length of one wall (fixes AR drift).
@@ -301,9 +317,13 @@ class RoomScan {
         'surfaces': surfaces.map((s) => s.toJson()).toList(),
         'photos': photos,
         'lines': lines.map((l) => l.toJson()).toList(),
-        'height': height,
+        if (elements.isNotEmpty)
+          'elements': elements.map((e) => e.toJson()).toList(),
+        if (photoPins.isNotEmpty)
+          'photoPins': photoPins.map((p) => p.toJson()).toList(),
         'scale': scale,
         'keepOrientation': keepOrientation,
+        if (ceilingHeight != null) 'ceilingHeight': ceilingHeight,
       };
 
   factory RoomScan.fromJson(Map<String, dynamic> j) => RoomScan(
@@ -324,9 +344,56 @@ class RoomScan {
         lines: (j['lines'] as List? ?? [])
             .map((l) => MeasuredLine.fromJson(l as Map<String, dynamic>))
             .toList(),
-        height: (j['height'] as num?)?.toDouble(),
+        // Older saves also hold a ceiling 'height'; it is no longer used.
+        elements: (j['elements'] as List? ?? [])
+            .map((e) => RoomElement.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        photoPins: (j['photoPins'] as List? ?? [])
+            .map((p) => PhotoPin.fromJson(p as Map<String, dynamic>))
+            .toList(),
         scale: (j['scale'] as num?)?.toDouble() ?? 1.0,
         keepOrientation: j['keepOrientation'] as bool? ?? false,
+        // Older saves' 'height' was a typed guess, not a measurement: only
+        // 'ceilingHeight' (LiDAR) is read.
+        ceilingHeight: (j['ceilingHeight'] as num?)?.toDouble(),
+      );
+}
+
+/// Where a photo was taken during a scan: [position] on the floor plan (in
+/// the room's scan coordinates) and the way the camera looked
+/// ([direction], unit length, null when unknown).
+class PhotoPin {
+  const PhotoPin({required this.file, required this.position, this.direction, this.panorama = false});
+
+  /// The photo's file name (one of RoomScan.photos).
+  final String file;
+  final Vec2 position;
+  final Vec2? direction;
+
+  /// A 360° photo (equirectangular, from a 360° camera): shown in the 360°
+  /// viewer and marked "360" on the plan.
+  final bool panorama;
+
+  PhotoPin copyWith({Vec2? position, Vec2? direction}) => PhotoPin(
+      file: file,
+      position: position ?? this.position,
+      direction: direction ?? this.direction,
+      panorama: panorama);
+
+  Map<String, dynamic> toJson() => {
+        'file': file,
+        'position': position.toJson(),
+        if (direction != null) 'direction': direction!.toJson(),
+        if (panorama) 'panorama': true,
+      };
+
+  factory PhotoPin.fromJson(Map<String, dynamic> j) => PhotoPin(
+        file: j['file'] as String,
+        position: Vec2.fromJson(j['position'] as Map<String, dynamic>),
+        direction: j['direction'] == null
+            ? null
+            : Vec2.fromJson(j['direction'] as Map<String, dynamic>),
+        panorama: j['panorama'] as bool? ?? false,
       );
 }
 
@@ -401,14 +468,84 @@ class MeasuredLine {
       );
 }
 
-/// A door or window measured on its own, without a room around it (the
-/// scan finished on its ✓ before any room outline was found).
+/// Something other than a wall, door or window found in a scanned room:
+/// furniture or a fixture (Apple RoomPlan on LiDAR devices finds these).
+class RoomElement {
+  const RoomElement({
+    required this.kind,
+    this.width,
+    this.depth,
+    this.height,
+    this.position,
+    this.angle,
+  });
+
+  /// What it is, e.g. "Bed", "Sofa", "Sink".
+  final String kind;
+
+  /// Its size in metres, when known.
+  final double? width, depth, height;
+
+  /// Its centre on the floor plan, in the scan's coordinates.
+  final Vec2? position;
+
+  /// Which way its width runs, in the scan's coordinates (radians from +x
+  /// towards +y); null when not known.
+  final double? angle;
+
+  RoomElement copyWith({Vec2? position, double? angle}) => RoomElement(
+      kind: kind,
+      width: width,
+      depth: depth,
+      height: height,
+      position: position ?? this.position,
+      angle: angle ?? this.angle);
+
+  Map<String, dynamic> toJson() => {
+        'kind': kind,
+        if (width != null) 'width': width,
+        if (depth != null) 'depth': depth,
+        if (height != null) 'height': height,
+        if (position != null) 'position': position!.toJson(),
+        if (angle != null) 'angle': angle,
+      };
+
+  factory RoomElement.fromJson(Map<String, dynamic> j) => RoomElement(
+        kind: j['kind'] as String,
+        width: (j['width'] as num?)?.toDouble(),
+        depth: (j['depth'] as num?)?.toDouble(),
+        height: (j['height'] as num?)?.toDouble(),
+        position: j['position'] == null
+            ? null
+            : Vec2.fromJson(j['position'] as Map<String, dynamic>),
+        angle: (j['angle'] as num?)?.toDouble(),
+      );
+}
+
+/// How many of each kind of thing a room has: "2 Doors", "1 Bed".
+/// Doors, windows and open gaps come first, then other elements by kind.
+List<(String, int)> roomElementCounts(RoomScan scan) {
+  final counts = <String, int>{};
+  void add(String k) => counts[k] = (counts[k] ?? 0) + 1;
+  for (final t in OpeningType.values) {
+    final n = scan.openings.where((o) => o.type == t).length;
+    if (n > 0) counts[t.label] = n;
+  }
+  for (final e in scan.elements) {
+    add(e.kind);
+  }
+  return [for (final e in counts.entries) (e.key, e.value)];
+}
+
+/// A door or window measured on its own, without a room outline around it.
+/// [room] says which room it belongs to, when the user gave one.
 class SavedOpening {
   const SavedOpening({
     required this.id,
     required this.name,
     required this.type,
     required this.width,
+    this.room = '',
     this.height,
     this.sill,
     this.method = OpeningMethod.auto,
@@ -418,6 +555,9 @@ class SavedOpening {
 
   final String id;
   final String name;
+
+  /// The room it is in (typed by the user); empty when not given.
+  final String room;
   final OpeningType type;
   final double width;
   final double? height;
@@ -428,22 +568,30 @@ class SavedOpening {
   final bool estimated;
   final DateTime measuredAt;
 
-  SavedOpening copyWith({String? name, double? width, double? height, double? sill}) =>
+  SavedOpening copyWith(
+          {String? name,
+          String? room,
+          double? width,
+          double? height,
+          double? sill,
+          bool? estimated}) =>
       SavedOpening(
         id: id,
         name: name ?? this.name,
+        room: room ?? this.room,
         type: type,
         width: width ?? this.width,
         height: height ?? this.height,
         sill: sill ?? this.sill,
         method: method,
-        estimated: estimated,
+        estimated: estimated ?? this.estimated,
         measuredAt: measuredAt,
       );
 
   Map<String, dynamic> toJson() => {
         'id': id,
         'name': name,
+        if (room.isNotEmpty) 'room': room,
         'type': type.name,
         'width': width,
         if (height != null) 'height': height,
@@ -456,6 +604,7 @@ class SavedOpening {
   factory SavedOpening.fromJson(Map<String, dynamic> j) => SavedOpening(
         id: j['id'] as String,
         name: j['name'] as String,
+        room: j['room'] as String? ?? '',
         type: OpeningType.values.byName(j['type'] as String),
         width: (j['width'] as num).toDouble(),
         height: (j['height'] as num?)?.toDouble(),

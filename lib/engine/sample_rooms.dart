@@ -68,7 +68,6 @@ class SampleRooms {
           Opening(
               type: OpeningType.window, wallIndex: 2, center: 0.5, width: 1.5),
         ],
-        height: 2.70,
       );
 
   static RoomScan lShape() => RoomScan(
@@ -85,7 +84,6 @@ class SampleRooms {
           Opening(
               type: OpeningType.window, wallIndex: 4, center: 0.5, width: 1.8),
         ],
-        height: 2.85,
       );
 
   static RoomScan rectangleFromLengths() => RoomScan(

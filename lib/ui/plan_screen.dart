@@ -1,6 +1,9 @@
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:panorama_viewer/panorama_viewer.dart';
 import 'package:printing/printing.dart';
 
 import '../engine/floor_plan_builder.dart';
@@ -11,6 +14,9 @@ import '../engine/units.dart';
 import '../services/app_settings.dart';
 import '../services/plan_exporter.dart';
 import '../services/scan_store.dart';
+import '../scanner/cad_export.dart';
+import '../scanner/room_model_3d.dart';
+import '../scanner/scanner_3d_screen.dart';
 import 'app_theme.dart';
 import 'common.dart';
 import 'opening_editor_screen.dart';
@@ -79,12 +85,17 @@ class _PlanScreenState extends State<PlanScreen>
   /// The finger that just lifted moved a circle: its tap is ignored.
   bool _suppressTap = false;
 
+  /// A 360° photo just added (its file name), waiting for a tap on the plan
+  /// where it was taken.
+  String? _placingPano;
+
   LengthUnit get unit => AppSettings.unit.value;
 
   @override
   void initState() {
     super.initState();
     _rebuild();
+    if (plan != null) _lastGood = scan.toJson();
     final k = widget.openOpening;
     if (k != null && k >= 0 && k < scan.openings.length) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -120,9 +131,53 @@ class _PlanScreenState extends State<PlanScreen>
     }
   }
 
+  /// The scan as it last built into a plan: an edit that breaks the plan
+  /// (a corner dragged onto its neighbour, a wall typed 0 long) goes back
+  /// to it instead of being saved, which left a room that never opened
+  /// again.
+  Map<String, dynamic>? _lastGood;
+
   Future<void> _changed() async {
     setState(_rebuild);
+    if (plan == null && _lastGood != null) {
+      final why = error;
+      setState(() {
+        scan = RoomScan.fromJson(_lastGood!);
+        _rebuild();
+      });
+      if (mounted) {
+        showMessage(context, 'That change was undone: ${why ?? 'the room could not be drawn.'}');
+      }
+      return;
+    }
+    if (plan != null) _lastGood = scan.toJson();
     if (_saved) await ScanStore.save(scan);
+  }
+
+  /// A saved room whose plan can't be built: drops the walls too short to
+  /// have a direction (corners on top of each other), when that fixes it.
+  Future<void> _repair() async {
+    final kept = [for (final w in scan.walls) if (w.length >= 0.05) w];
+    if (kept.length < 3 || kept.length == scan.walls.length) return;
+    final trial = RoomScan.fromJson(scan.toJson());
+    trial.walls
+      ..clear()
+      ..addAll(kept);
+    trial.openings.removeWhere((o) => o.wallIndex >= kept.length);
+    try {
+      FloorPlanBuilder(squareCorners: squareCorners).build(trial);
+    } on PlanException {
+      if (mounted) showMessage(context, 'The room could not be repaired. Measure it again.');
+      return;
+    }
+    scan = trial;
+    await _changed();
+    if (mounted) showMessage(context, 'Repaired: the wall too short to draw was removed.');
+  }
+
+  bool get _repairable {
+    final kept = scan.walls.where((w) => w.length >= 0.05).length;
+    return kept >= 3 && kept < scan.walls.length;
   }
 
   Future<void> _save() async {
@@ -143,6 +198,7 @@ class _PlanScreenState extends State<PlanScreen>
       });
     }
     await ScanStore.save(scan);
+    if (!mounted) return;
     setState(() => _saved = true);
     if (mounted) showMessage(context, 'Room saved');
   }
@@ -164,19 +220,6 @@ class _PlanScreenState extends State<PlanScreen>
     if (!ok) return;
     await ScanStore.delete(scan.id);
     if (mounted) Navigator.pop(context);
-  }
-
-  Future<void> _editHeight() async {
-    final h = await askLength(context,
-        title: 'Ceiling height',
-        unit: unit,
-        initial: scan.height,
-        label: 'Height',
-        helper: 'Leave empty to remove the height.',
-        optional: true);
-    if (h == null) return;
-    scan.height = h.isNaN ? null : h;
-    await _changed();
   }
 
   Future<void> _setWallLength(int i) async {
@@ -216,7 +259,7 @@ class _PlanScreenState extends State<PlanScreen>
         content: Text(
           'Scan: ${formatLength(scanned, unit)}\n'
           'Tape: ${formatLength(len, unit)}\n'
-          'Difference: ${diff >= 0 ? '+' : '−'}${(diff.abs() * 100).toStringAsFixed(1)} cm '
+          'Difference: ${diff >= 0 ? '+' : '−'}${formatLength(diff.abs(), unit)} '
           '(${pct >= 0 ? '+' : '−'}${pct.abs().toStringAsFixed(1)} %)\n\n'
           '${close ? 'This wall matches the tape to within 1 %.' : 'Rescaling makes this wall exactly match the tape and corrects every other length in the plan by the same factor.'}',
         ),
@@ -299,6 +342,7 @@ class _PlanScreenState extends State<PlanScreen>
           plan: p,
           opening: scan.openings[index],
           label: _openingLabel(index),
+          roomName: scan.name,
         ),
       ),
     );
@@ -335,9 +379,55 @@ class _PlanScreenState extends State<PlanScreen>
     await _changed();
   }
 
+  /// Adds a 360° photo from the phone's gallery (any 360° camera's app
+  /// saves them there as 2:1 equirectangular images), then the user taps the
+  /// plan where it was taken.
+  Future<void> _addPanorama() async {
+    final x = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 8000);
+    if (x == null || !mounted) return;
+    // Its size without decoding the whole (often very large) image.
+    final buffer = await ui.ImmutableBuffer.fromUint8List(await File(x.path).readAsBytes());
+    final desc = await ui.ImageDescriptor.encoded(buffer);
+    final ratio = desc.width / desc.height;
+    desc.dispose();
+    buffer.dispose();
+    if (!mounted) return;
+    if ((ratio - 2).abs() > 0.15) {
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Not a 360° photo?'),
+          content: const Text('360° photos are twice as wide as they are high. '
+              'This one is not, so it may not look right in the 360° view.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Add anyway')),
+          ],
+        ),
+      );
+      if (go != true || !mounted) return;
+    }
+    final name = await ScanStore.keepPhoto(x.path, prefix: 'pano');
+    if (!mounted) return;
+    setState(() {
+      scan.photos.add(name);
+      _placingPano = name;
+      editing = false;
+    });
+    await _changed();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      duration: const Duration(minutes: 1),
+      content: const Text('Tap the plan where the 360° photo was taken'),
+      action: SnackBarAction(label: 'Later', onPressed: () => setState(() => _placingPano = null)),
+    ));
+  }
+
   Future<void> _showPhoto(int k) async {
     final f = await ScanStore.photoFile(scan.photos[k]);
     if (!mounted) return;
+    final pano = scan.photoPins.any((p) => p.file == scan.photos[k] && p.panorama) ||
+        scan.photos[k].startsWith('pano_');
     final remove = await Navigator.push<bool>(
       context,
       MaterialPageRoute(
@@ -355,15 +445,19 @@ class _PlanScreenState extends State<PlanScreen>
               ),
             ],
           ),
-          body: InteractiveViewer(
-            maxScale: 6,
-            child: Center(child: Image.file(f)),
-          ),
+          // 360° photos: look round by dragging or by turning the phone.
+          body: pano
+              ? PanoramaViewer(sensorControl: SensorControl.orientation, child: Image.file(f))
+              : InteractiveViewer(
+                  maxScale: 6,
+                  child: Center(child: Image.file(f)),
+                ),
         ),
       ),
     );
     if (remove != true) return;
-    scan.photos.removeAt(k);
+    final removed = scan.photos.removeAt(k);
+    scan.photoPins.removeWhere((p) => p.file == removed);
     if (await f.exists()) await f.delete();
     await _changed();
   }
@@ -380,15 +474,27 @@ class _PlanScreenState extends State<PlanScreen>
       switch (kind) {
         case 'png':
           final f = await PlanExporter.savePng(scan, p, unit);
-          if (mounted) showMessage(context, 'Image saved to ${f.path}');
+          if (mounted) await deliverFile(context, f, what: 'Image');
         case 'pdf':
           final f = await PlanExporter.savePdf(scan, p, unit);
-          if (mounted) showMessage(context, 'PDF saved to ${f.path}');
+          if (mounted) await deliverFile(context, f, what: 'PDF');
         case 'share':
           final bytes = await PlanExporter.buildPdf(scan, p, unit);
           await Printing.sharePdf(
               bytes: bytes,
               filename: '${PlanExporter.safeName(scan.name)}.pdf');
+        case 'csv':
+          final f = await PlanExporter.saveCsv([(scan, p)], unit,
+              name: scan.name);
+          if (mounted) await deliverFile(context, f, what: 'Spreadsheet (CSV)');
+        case 'dxf':
+          final f = await CadExporter.saveDxf([RoomInput(scan, p)], unit,
+              name: scan.name);
+          if (mounted) await deliverFile(context, f, what: 'CAD drawing (DXF)');
+        case 'obj':
+          final files = await CadExporter.saveObj(RoomModel3D.single(scan, p),
+              name: scan.name);
+          if (mounted) await deliverFiles(context, files, what: '3D model (OBJ)');
       }
     } catch (e) {
       if (mounted) showMessage(context, 'Export failed: $e');
@@ -492,6 +598,30 @@ class _PlanScreenState extends State<PlanScreen>
   }
 
   void _onTap(FloorPlan p, PlanLayout l, Offset pos) {
+    // Placing a 360° photo: it goes where the plan was tapped.
+    final placing = _placingPano;
+    if (placing != null) {
+      setState(() {
+        scan.photoPins.removeWhere((x) => x.file == placing);
+        scan.photoPins.add(PhotoPin(file: placing, position: p.fromPlan(l.toPlan(pos)), panorama: true));
+        _placingPano = null;
+      });
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      _changed();
+      return;
+    }
+    // A photo marker: open the photo.
+    if (!editing) {
+      final r = 20 / _zoom;
+      for (final pin in scan.photoPins) {
+        final k = scan.photos.indexOf(pin.file);
+        if (k < 0) continue;
+        if ((l.toScreen(p.toPlan(pin.position)) - pos).distance <= r) {
+          _showPhoto(k);
+          return;
+        }
+      }
+    }
     if (editing) {
       final c = _hitCorner(p, l, pos);
       if (c != null) {
@@ -696,10 +826,13 @@ class _PlanScreenState extends State<PlanScreen>
                     : FloorPlan(
                         corners: _dragCorners ?? p.corners,
                         openings: p.openings,
-                        height: p.height,
                         warnings: const [],
                         snappedWalls: 0,
                         surfaces: p.surfaces,
+                        ceilingHeight: p.ceilingHeight,
+                        rotation: p.rotation,
+                        scale: p.scale,
+                        origin: p.origin,
                         lines: [
                           for (var j = 0; j < p.lines.length; j++)
                             j == k && moved != null ? moved : p.lines[j],
@@ -740,6 +873,17 @@ class _PlanScreenState extends State<PlanScreen>
                           editing: editing,
                           handles: true,
                           zoom: _zoom,
+                          furniture: furnitureOnPlan(scan, p),
+                          photoPins: [
+                            for (final pin in scan.photoPins)
+                              if (scan.photos.contains(pin.file))
+                                (
+                                  p.toPlan(pin.position),
+                                  pin.direction == null ? null : p.dirToPlan(pin.direction!),
+                                  scan.photos.indexOf(pin.file) + 1,
+                                  pin.panorama,
+                                ),
+                          ],
                         ),
                       ),
                     ),
@@ -773,34 +917,54 @@ class _PlanScreenState extends State<PlanScreen>
     final doors = p.openings.where((o) => o.type == OpeningType.door).length;
     final windows =
         p.openings.where((o) => o.type == OpeningType.window).length;
+    final gaps = p.openings.where((o) => o.type == OpeningType.opening).length;
     final tiles = [
       MetricTile(
           icon: Icons.crop_free_rounded,
           label: 'Perimeter',
           value: formatLength(p.perimeter, unit)),
       MetricTile(
-        icon: Icons.height_rounded,
-        label: 'Ceiling height',
-        value: p.height != null ? formatLength(p.height!, unit) : 'Add height',
-        placeholder: p.height == null,
-        onTap: _editHeight,
+          icon: Icons.polyline_outlined,
+          label: 'Walls · Corners',
+          value: '${p.wallCount} · ${p.wallCount}'),
+      MetricTile(
+        icon: Icons.door_front_door_outlined,
+        label: 'Doors',
+        value: '$doors',
+        onTap: () => _tabs.animateTo(2),
       ),
       MetricTile(
+        icon: Icons.window_outlined,
+        label: 'Windows',
+        value: '$windows',
+        onTap: () => _tabs.animateTo(2),
+      ),
+      if (gaps > 0)
+        MetricTile(
+          icon: Icons.crop_free_rounded,
+          label: 'Open gaps',
+          value: '$gaps',
+          onTap: () => _tabs.animateTo(2),
+        ),
+      if (scan.elements.isNotEmpty)
+        MetricTile(
+          icon: Icons.chair_outlined,
+          label: 'Other elements',
+          value: '${scan.elements.length}',
+        ),
+      // Measured by the LiDAR scanner; the camera scanner can't.
+      if (p.ceilingHeight != null) ...[
+        MetricTile(
+          icon: Icons.height_rounded,
+          label: 'Ceiling height',
+          value: formatLength(p.ceilingHeight!, unit),
+        ),
+        MetricTile(
           icon: Icons.view_in_ar_outlined,
-          label: 'Volume',
-          value: p.volume != null ? formatVolume(p.volume!, unit) : '—'),
-      MetricTile(
-          icon: Icons.format_paint_outlined,
-          label: 'Wall area (net)',
-          value: p.netWallArea != null ? formatArea(p.netWallArea!, unit) : '—'),
-      MetricTile(
-          icon: Icons.polyline_outlined,
-          label: 'Walls',
-          value: '${p.wallCount}'),
-      MetricTile(
-          icon: Icons.sensor_door_outlined,
-          label: 'Doors · Windows',
-          value: '$doors · $windows'),
+          label: 'Wall area',
+          value: formatArea(PlanExporter.wallArea(p), unit),
+        ),
+      ],
       MetricTile(
         icon: Icons.texture_rounded,
         label: 'Measured surfaces',
@@ -832,7 +996,8 @@ class _PlanScreenState extends State<PlanScreen>
               message: [
                 '${formatLength(size.width, unit)} × ${formatLength(size.depth, unit)}',
                 formatArea(p.area, unit),
-                if (p.height != null) 'height ${formatLength(p.height!, unit)}',
+                '$doors door${doors == 1 ? '' : 's'}',
+                '$windows window${windows == 1 ? '' : 's'}',
               ].join('  ·  '),
               trailing: IconButton(
                 tooltip: 'Dismiss',
@@ -888,6 +1053,29 @@ class _PlanScreenState extends State<PlanScreen>
                     child: t),
             ],
           ),
+          // Everything counted in the room: doors, windows, gaps and the
+          // furniture / fixtures the scanner found.
+          if (scan.openings.isNotEmpty || scan.elements.isNotEmpty) ...[
+            const SectionLabel('Found in this room'),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final (kind, n) in roomElementCounts(scan))
+                      Chip(
+                        visualDensity: VisualDensity.compact,
+                        label: Text('$n × $kind',
+                            style: const TextStyle(
+                                fontFeatures: AppTheme.tabular)),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ],
           if (scan.photos.isNotEmpty) ...[
             const SectionLabel('Photos'),
             SizedBox(
@@ -899,6 +1087,7 @@ class _PlanScreenState extends State<PlanScreen>
                 itemBuilder: (_, k) => _PhotoThumb(
                   name: scan.photos[k],
                   onTap: () => _showPhoto(k),
+                  number: scan.photoPins.any((p) => p.file == scan.photos[k]) ? k + 1 : null,
                 ),
               ),
             ),
@@ -912,8 +1101,6 @@ class _PlanScreenState extends State<PlanScreen>
                 if (p.snappedWalls > 0) '${p.snappedWalls} walls squared',
                 if (scan.scale != 1.0)
                   'calibrated ×${scan.scale.toStringAsFixed(3)}',
-                if (p.height == null)
-                  'add the ceiling height for volume and wall area',
               ].join('  ·  '),
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: cs.onSurfaceVariant),
@@ -1161,7 +1348,7 @@ class _PlanScreenState extends State<PlanScreen>
       valueListenable: AppSettings.unit,
       builder: (context, _, _) => Scaffold(
         appBar: AppBar(
-          titleSpacing: 20,
+          titleSpacing: 0,
           title: InkWell(
             onTap: _rename,
             borderRadius: BorderRadius.circular(AppTheme.radiusS),
@@ -1183,7 +1370,18 @@ class _PlanScreenState extends State<PlanScreen>
             ),
           ),
           actions: [
-            const UnitButton(),
+            const UnitButton(compact: true),
+            IconButton(
+              tooltip: '3D view',
+              icon: const Icon(Icons.view_in_ar_rounded),
+              onPressed: plan == null
+                  ? null
+                  : () => Navigator.push(
+                      context,
+                      MaterialPageRoute<void>(
+                          builder: (_) => Scanner3DScreen(
+                              rooms: [RoomInput(scan, plan!)], title: scan.name))),
+            ),
             PopupMenuButton<String>(
               tooltip: 'Export',
               icon: const Icon(Icons.ios_share_rounded),
@@ -1206,6 +1404,21 @@ class _PlanScreenState extends State<PlanScreen>
                     child: ListTile(
                         leading: Icon(Icons.image_outlined),
                         title: Text('Save image'))),
+                const PopupMenuItem(
+                    value: 'csv',
+                    child: ListTile(
+                        leading: Icon(Icons.table_chart_outlined),
+                        title: Text('Spreadsheet (CSV)'))),
+                const PopupMenuItem(
+                    value: 'dxf',
+                    child: ListTile(
+                        leading: Icon(Icons.architecture_outlined),
+                        title: Text('CAD drawing (DXF)'))),
+                const PopupMenuItem(
+                    value: 'obj',
+                    child: ListTile(
+                        leading: Icon(Icons.view_in_ar_outlined),
+                        title: Text('3D model (OBJ)'))),
               ],
             ),
             PopupMenuButton<String>(
@@ -1215,6 +1428,8 @@ class _PlanScreenState extends State<PlanScreen>
                 switch (v) {
                   case 'rename':
                     _rename();
+                  case 'pano':
+                    _addPanorama();
                   case 'square':
                     squareCorners = !squareCorners;
                     _changed();
@@ -1228,6 +1443,11 @@ class _PlanScreenState extends State<PlanScreen>
                     child: ListTile(
                         leading: Icon(Icons.drive_file_rename_outline),
                         title: Text('Rename'))),
+                const PopupMenuItem(
+                    value: 'pano',
+                    child: ListTile(
+                        leading: Icon(Icons.panorama_photosphere_outlined),
+                        title: Text('Add 360° photo'))),
                 CheckedPopupMenuItem(
                     value: 'square',
                     checked: squareCorners,
@@ -1246,7 +1466,10 @@ class _PlanScreenState extends State<PlanScreen>
           ],
         ),
         body: error != null
-            ? _ErrorView(message: error!)
+            ? _ErrorView(
+                message: error!,
+                onRepair: _repairable ? _repair : null,
+                onDelete: _saved ? _delete : null)
             : LayoutBuilder(builder: (context, c) {
                 final p = plan!;
                 final tabs = Column(children: [
@@ -1355,8 +1578,12 @@ class _EditBar extends StatelessWidget {
 }
 
 class _ErrorView extends StatelessWidget {
-  const _ErrorView({required this.message});
+  const _ErrorView({required this.message, this.onRepair, this.onDelete});
   final String message;
+
+  /// Fixes the room (drops a wall too short to draw), when that can work.
+  final VoidCallback? onRepair;
+  final VoidCallback? onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -1380,6 +1607,21 @@ class _ErrorView extends StatelessWidget {
               textAlign: TextAlign.center,
               style: theme.textTheme.bodyMedium
                   ?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
+          const SizedBox(height: 22),
+          if (onRepair != null)
+            FilledButton.icon(
+              onPressed: onRepair,
+              icon: const Icon(Icons.build_outlined),
+              label: const Text('Repair the room'),
+            ),
+          if (onDelete != null) ...[
+            const SizedBox(height: 8),
+            TextButton.icon(
+              onPressed: onDelete,
+              icon: const Icon(Icons.delete_outline_rounded),
+              label: const Text('Delete room'),
+            ),
+          ],
         ]),
       ),
     );
@@ -1435,7 +1677,7 @@ class _OpeningDialogState extends State<_OpeningDialog> {
     final h = _height.text.trim().isEmpty ? null : parseLength(_height.text, u);
     final sill = type != OpeningType.window || _sill.text.trim().isEmpty
         ? null
-        : parseLength(_sill.text, u);
+        : (LengthField.isZero(_sill.text) ? 0.0 : parseLength(_sill.text, u));
     Navigator.pop(
       context,
       Opening(
@@ -1616,10 +1858,13 @@ class _SurfaceDialogState extends State<_SurfaceDialog> {
 }
 
 class _PhotoThumb extends StatelessWidget {
-  const _PhotoThumb({required this.name, required this.onTap});
+  const _PhotoThumb({required this.name, required this.onTap, this.number});
 
   final String name;
   final VoidCallback onTap;
+
+  /// Shown when the photo is pinned on the plan (the pin's number).
+  final int? number;
 
   @override
   Widget build(BuildContext context) {
@@ -1632,10 +1877,24 @@ class _PhotoThumb extends StatelessWidget {
           child: SizedBox(
             width: 128,
             height: 96,
-            child: snap.hasData
-                ? Image.file(snap.data!, fit: BoxFit.cover, cacheWidth: 384)
-                : ColoredBox(
-                    color: Theme.of(context).colorScheme.outlineVariant),
+            child: Stack(fit: StackFit.expand, children: [
+              snap.hasData
+                  ? Image.file(snap.data!, fit: BoxFit.cover, cacheWidth: 384)
+                  : ColoredBox(
+                      color: Theme.of(context).colorScheme.outlineVariant),
+              if (number != null)
+                Positioned(
+                  left: 6,
+                  top: 6,
+                  child: CircleAvatar(
+                    radius: 10,
+                    backgroundColor: PlanPainter.accent,
+                    child: Text('$number',
+                        style: const TextStyle(
+                            color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700)),
+                  ),
+                ),
+            ]),
           ),
         ),
       ),

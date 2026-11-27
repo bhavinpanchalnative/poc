@@ -89,16 +89,15 @@ import kotlin.math.sqrt
  *  - Surface: any flat rectangle from three taps (two corners along one
  *    edge, then a point on the opposite edge).
  *  - Line: the straight-line (3D) distance between any two points.
- *  - Height: aim at the ceiling (detected automatically when possible).
  *
- * Returns corners (x, z), openings, surfaces (raw 3D points) and the room
- * height to Flutter.
+ * Returns corners (x, z), openings, surfaces and lines (raw 3D points) to
+ * Flutter. The ceiling is only used internally (to tell walls from
+ * furniture); no room height is measured or returned.
  */
 class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
 
     private enum class Mode(val label: String) {
         AUTO("Auto"), CORNER("Corners"), DOOR("Door"), WINDOW("Window"), SURFACE("Surface"), LINE("Line"),
-        HEIGHT("Height"),
     }
 
 
@@ -272,11 +271,11 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
     private val cloud = HashMap<Int, Vec3>()
 
     /**
-     * Depth samples by 5 cm voxel, with how often each was seen (GL thread
-     * only). Depth works on plain walls and floors, where ARCore finds few
-     * feature points and often no planes at all.
+     * Depth samples by 5 cm voxel, each standing for the mean of its samples
+     * (GL thread only). Depth works on plain walls and floors, where ARCore
+     * finds few feature points and often no planes at all.
      */
-    private val depthVoxels = HashMap<Long, Int>()
+    private val depthVoxels = DepthVoxelGrid(VOXEL, MAX_VOXELS)
     private var depthDots: List<Vec3> = emptyList()
     private var lastDepthCount = 0
 
@@ -286,10 +285,59 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
     /** Door / window detection (and its diagnostics) runs here. */
     private val openingExecutor = Executors.newSingleThreadExecutor()
 
+    /** AI furniture detection runs here (its model is made, and used, only
+     *  on this thread). */
+    private val furnitureExecutor = Executors.newSingleThreadExecutor()
+    private var furnitureModel: FurnitureModel? = null
+    private var furnitureModelFailed = false
+    @Volatile
+    private var furnitureInFlight = false
+    private var lastFurnitureAttempt = 0L
+
+    /** Furniture found so far in the room scan (UI thread). */
+    private val furniture = FurnitureTracker()
+
+    /** How the camera sensor is turned against the phone (degrees). */
+    private val sensorOrientation by lazy {
+        runCatching {
+            val id = session?.cameraConfig?.cameraId ?: return@runCatching 90
+            getSystemService(android.hardware.camera2.CameraManager::class.java)
+                .getCameraCharacteristics(id)
+                .get(android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        }.getOrDefault(90)
+    }
+
     /** Door / window Auto: what to look for, set by the UI thread; null when
      *  not looking. */
     @Volatile
     private var autoOpeningKind: OpeningKind? = null
+
+    /**
+     * Room scan (Auto mode): doors and windows are looked for on whatever
+     * wall is in view while the room is measured (both kinds in each image),
+     * and counted automatically once a detection holds steady.
+     * Set by the UI thread.
+     */
+    @Volatile
+    private var roomOpeningScan = false
+
+    /**
+     * Room scan (Auto mode): the live 2D floor plan fills the lower part of
+     * the screen and the walls, doors and windows found are drawn on it
+     * instead of over the camera image. Tapping the plan switches to the
+     * camera overlay with the small mini-map, and back (UI thread).
+     */
+    // The camera view, with the walls outlined in it, fills the screen, and
+    // the plan is a small map; tap the map for the big plan.
+    private var planBig = false
+
+    private fun livePlanShown() = (mode == Mode.AUTO || mode == Mode.CORNER) && !lineOnly && planBig
+
+    /** Room scan: detections so far, per kind (UI thread). */
+    private val roomConsensus = mapOf(
+        OpeningKind.DOOR to OpeningConsensus.forRoomScan(),
+        OpeningKind.WINDOW to OpeningConsensus.forRoomScan(),
+    )
 
     /** A door / window attempt is being computed (at most one at a time). */
     @Volatile
@@ -427,9 +475,13 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
 
     private var adjusted: AdjustedOpening? = null
 
-    /** What the finger holds: corners 0-3 (bottom-left, bottom-right,
-     *  top-right, top-left), edges 4-7 (bottom, right, top, left); -1 none. */
+    /** The side the finger holds: 0 bottom, 1 right, 2 top, 3 left; -1 none.
+     *  Only that side moves: the opposite and adjacent sides stay put. */
     private var adjustGrab = -1
+
+    /** Where the held side was relative to the finger when grabbed (m along
+     *  the wall, or height), so it moves with the finger without jumping. */
+    private var adjustOffset = 0f
     private var lastStableAt = 0L
     /** The latest attempt with a wall (its image is saved with diagnostics). */
     private var lastOpeningResult: OpeningResult? = null
@@ -440,7 +492,6 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
     /** Started just to measure distances ([EXTRA_START_MODE] "line"): no room
      *  outline is needed to finish, and none is returned. */
     private var lineOnly = false
-    private val heightMarks = mutableListOf<Float>()
     private val history = mutableListOf<Int>()
     private var flashMessage: String? = null
     private var flashUntil = 0L
@@ -466,6 +517,12 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
     /** Corners mode was chosen since the last Start over: the user is outlining
      *  by hand, so only Finish ends the scan. */
     private var cornersChosen = false
+
+    /** The "room not measured yet" question, while it shows. */
+    private var weakFinishDialog: AlertDialog? = null
+
+    /** Half or more of the outline's sides were guessed, not measured. */
+    private fun mostlyEstimated(room: AutoRoom) = room.estimatedCount * 2 >= room.corners.size
     /** When the auto room last changed noticeably (or stopped qualifying). */
     private var stableSince = 0L
     /** The room [stableSince] refers to; compared against that, not the
@@ -622,6 +679,8 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         handler.removeCallbacks(autoFinish)
         detector.shutdownNow()
         openingExecutor.shutdownNow()
+        furnitureExecutor.execute { runCatching { furnitureModel?.close() } }
+        furnitureExecutor.shutdown()
         session?.close()
         session = null
         diag("scan closed")
@@ -785,7 +844,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             if (frameCount % 60 == 0L) {
                 diag(
                     "frame: camY=${String.format("%.2f", origin.y)} points=${cloud.size} " +
-                        "depthVoxels=${depthVoxels.size} lastDepth=$lastDepthCount " +
+                        "depthVoxels=${depthVoxels.count} lastDepth=$lastDepthCount " +
                         "floorY=${glFloorY?.let { String.format("%.2f", it) }} " +
                         "pointFloorY=${glPointFloorY?.let { String.format("%.2f", it) }} surfaces=" +
                         planes.joinToString(" ") {
@@ -828,9 +887,9 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             // Automatic room outline, refreshed a few times per second on the
             // detector thread (the last good outline is kept meanwhile).
             if (frameCount % 10 == 0L && camSamples > 0 && !detecting) {
-                val cloudNow = ArrayList<Vec3>(cloud.size + depthVoxels.size)
+                val cloudNow = ArrayList<Vec3>(cloud.size + depthVoxels.count)
                 cloudNow.addAll(cloud.values)
-                for ((key, hits) in depthVoxels) if (hits >= 2) cloudNow.add(voxelCentre(key))
+                depthVoxels.forEachMean(2) { x, y, z -> cloudNow.add(Vec3(x, y, z)) }
                 val camY = (camSumY / camSamples).toFloat()
                 if (planeFloorY == null && frameCount % 30 == 0L) {
                     estimateFloor(cloudNow, camY)?.let { glPointFloorY = it }
@@ -877,6 +936,26 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                 if (!openingInFlight && now - lastOpeningAttempt >= OPENING_INTERVAL_MS) {
                     lastOpeningAttempt = now
                     startOpeningAttempt(kind, frame, camera, planes, polygons, floorY, ray, viewProj)
+                }
+            } ?: run {
+                // Room scan: doors and windows are found along the way, both
+                // looked for in each image (a little less often, so the room
+                // detection keeps its share of the phone). They used to
+                // alternate, which halved how often each was seen while the
+                // camera swept past.
+                if (!roomOpeningScan) return@run
+                val now = SystemClock.uptimeMillis()
+                if (!openingInFlight && now - lastOpeningAttempt >= ROOM_OPENING_INTERVAL_MS) {
+                    lastOpeningAttempt = now
+                    startOpeningAttempt(OpeningKind.DOOR, frame, camera, planes, polygons, floorY, ray, viewProj, roomScan = true)
+                }
+                // AI furniture detection, once the floor is known (furniture
+                // is placed where it stands on it).
+                if (floorY != null && !furnitureInFlight && !furnitureModelFailed &&
+                    now - lastFurnitureAttempt >= FURNITURE_INTERVAL_MS
+                ) {
+                    lastFurnitureAttempt = now
+                    startFurnitureAttempt(frame, camera, floorY)
                 }
             }
 
@@ -1080,6 +1159,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
     private fun startOpeningAttempt(
         kind: OpeningKind, frame: com.google.ar.core.Frame, camera: com.google.ar.core.Camera,
         planes: List<Plane>, polygons: Map<Plane, FloatArray>, floorY: Float?, ray: Ray, viewProj: FloatArray,
+        roomScan: Boolean = false,
     ) {
         val gen = scanGeneration
         val wall = openingWall(kind, frame, planes, polygons, floorY, ray, viewProj)
@@ -1112,7 +1192,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                     // when that line is in view (see OpeningDetector.measure):
                     // a detected wall a few cm out, or a guessed one, made the
                     // door / window that much too small or too large.
-                    val res = OpeningDetector.measure(kind, wall.frame, cam, lum)
+                    val res = OpeningDetector.measure(kind, wall.frame, cam, lum, wide = roomScan)
                     val fl = res.floorLine
                     if (fl != null && System.currentTimeMillis() - lastFloorLineDiagAt > 2000L) {
                         lastFloorLineDiagAt = System.currentTimeMillis()
@@ -1123,7 +1203,20 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                     // A window's wall taken through the floor at the bottom of
                     // the screen is only a guess, of no use unless the floor
                     // line confirmed where the wall is.
-                    if (fl == null && wall.source == "floor" && kind == OpeningKind.WINDOW) {
+                    val windowWallOk = fl != null || wall.source != "floor"
+                    if (roomScan) {
+                        // The same image and wall, searched for a window too.
+                        val win = if (windowWallOk) OpeningDetector.search(OpeningKind.WINDOW, res.frame, res.image) else null
+                        var doorDet = res.detection
+                        val d = doorDet.candidate
+                        if (d != null && RoomOpeningCounter.doorIsWindow(d, win?.candidate, res.frame.floorY)) {
+                            doorDet = OpeningDetection(null, doorDet.columnProfile, doorDet.rowProfile)
+                        }
+                        runOnUiThread {
+                            onOpeningResult(OpeningResult(OpeningKind.DOOR, gen, used, res.image, doorDet))
+                            onOpeningResult(OpeningResult(OpeningKind.WINDOW, gen, if (win != null) used else null, res.image, win))
+                        }
+                    } else if (!windowWallOk && kind == OpeningKind.WINDOW) {
                         runOnUiThread { onOpeningResult(OpeningResult(kind, gen, null, null, null)) }
                     } else {
                         runOnUiThread { onOpeningResult(OpeningResult(kind, gen, used, res.image, res.detection)) }
@@ -1136,6 +1229,70 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             }
         } catch (e: Exception) {
             openingInFlight = false
+        }
+    }
+
+    /**
+     * AI furniture detection (GL thread): the camera image, copied at half
+     * size, goes to the detector on its own thread; what it finds is placed
+     * on the floor and added to [furniture] on the UI thread.
+     */
+    private fun startFurnitureAttempt(frame: com.google.ar.core.Frame, camera: com.google.ar.core.Camera, floorY: Float) {
+        val image = try {
+            frame.acquireCameraImage()
+        } catch (e: Exception) {
+            return
+        }
+        val yuv = try {
+            HalfYuv.copy(image)
+        } catch (e: Exception) {
+            Log.w(TAG, "camera image copy failed", e)
+            return
+        } finally {
+            image.close()
+        }
+        val intr = camera.imageIntrinsics
+        val dims = intr.imageDimensions
+        val sx = if (dims[0] > 0) yuv.sensorWidth.toFloat() / dims[0] else 1f
+        val sy = if (dims[1] > 0) yuv.sensorHeight.toFloat() / dims[1] else 1f
+        val pose = FloatArray(16)
+        camera.pose.toMatrix(pose, 0)
+        val cam = PinholeCamera(
+            pose, intr.focalLength[0] * sx, intr.focalLength[1] * sy,
+            intr.principalPoint[0] * sx, intr.principalPoint[1] * sy, yuv.sensorWidth, yuv.sensorHeight,
+        )
+        @Suppress("DEPRECATION")
+        val display = windowManager.defaultDisplay.rotation * 90
+        val degrees = ((sensorOrientation - display) % 360 + 360) % 360
+        val gen = scanGeneration
+        furnitureInFlight = true
+        try {
+            furnitureExecutor.execute {
+                try {
+                    val model = furnitureModel ?: FurnitureModel(this).also { furnitureModel = it }
+                    val bmp = yuv.toUprightBitmap(degrees)
+                    // Boxes are in the half-size upright picture.
+                    val toSensor = uprightToSensor(degrees, yuv.sensorWidth, yuv.sensorHeight)
+                    val uprightH = if (degrees % 180 == 0) yuv.sensorHeight else yuv.sensorWidth
+                    val found = model.detect(bmp).mapNotNull { d ->
+                        val full = Detection2D(d.label, d.score, d.left * 2, d.top * 2, d.right * 2, d.bottom * 2)
+                        FurniturePlacement.place(full, cam, floorY, uprightH.toFloat(), toSensor)
+                    }
+                    bmp.recycle()
+                    if (found.isNotEmpty()) {
+                        runOnUiThread { if (gen == scanGeneration) found.forEach(furniture::add) }
+                    }
+                } catch (e: Throwable) {
+                    // No model on this phone (or it failed to load): scan on
+                    // without furniture.
+                    Log.w(TAG, "furniture detection failed", e)
+                    if (furnitureModel == null) furnitureModelFailed = true
+                } finally {
+                    furnitureInFlight = false
+                }
+            }
+        } catch (e: Exception) {
+            furnitureInFlight = false
         }
     }
 
@@ -1390,11 +1547,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             ds.add(s)
         }
         for (p in cloud.values) test(p.x, p.y, p.z)
-        for ((key, hits) in depthVoxels) {
-            if (hits < 2) continue
-            val c = voxelCentre(key)
-            test(c.x, c.y, c.z)
-        }
+        depthVoxels.forEachMean(2) { x, y, z -> test(x, y, z) }
         if (ds.size < 6) return null
         ds.sort()
         return ds[ds.size / 2]
@@ -1488,14 +1641,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             rayHits[n++] = s
         }
         for (p in cloud.values) test(p.x, p.y, p.z)
-        for ((key, hits) in depthVoxels) {
-            if (hits < 2) continue
-            test(
-                ((((key ushr 42) and 0x1FFFFF) - VOXEL_OFFSET) + 0.5f) * VOXEL,
-                ((((key ushr 21) and 0x1FFFFF) - VOXEL_OFFSET) + 0.5f) * VOXEL,
-                (((key and 0x1FFFFF) - VOXEL_OFFSET) + 0.5f) * VOXEL,
-            )
-        }
+        depthVoxels.forEachMean(2) { x, y, z -> test(x, y, z) }
         if (n < 6) return null
         java.util.Arrays.sort(rayHits, 0, n)
         return rayHits[(n - 1) / 4]
@@ -1569,14 +1715,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             nearDist[i] = s
         }
         for (p in cloud.values) test(p.x, p.y, p.z)
-        for ((key, hits) in depthVoxels) {
-            if (hits < 2) continue
-            test(
-                ((((key ushr 42) and 0x1FFFFF) - VOXEL_OFFSET) + 0.5f) * VOXEL,
-                ((((key ushr 21) and 0x1FFFFF) - VOXEL_OFFSET) + 0.5f) * VOXEL,
-                (((key and 0x1FFFFF) - VOXEL_OFFSET) + 0.5f) * VOXEL,
-            )
-        }
+        depthVoxels.forEachMean(2) { x, y, z -> test(x, y, z) }
         if (n < 5) return null
         val d = nearDist.copyOf(kept)
         d.sort()
@@ -1690,10 +1829,9 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                         m[2] * xc + m[6] * yc + m[10] * zc + m[14],
                     )
                     out.add(p)
-                    val key = voxelKey(p)
-                    val prev = depthVoxels[key]
-                    if (prev != null) depthVoxels[key] = prev + 1
-                    else if (depthVoxels.size < MAX_VOXELS) depthVoxels[key] = 1
+                    // Depth error grows with the square of the distance:
+                    // near samples count for more in their voxel's mean.
+                    depthVoxels.add(p.x, p.y, p.z, 1f / (d * d))
                 }
             }
         } catch (e: Exception) {
@@ -1705,16 +1843,6 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         return out
     }
 
-    private fun voxelKey(p: Vec3): Long {
-        fun idx(a: Float) = (kotlin.math.floor(a / VOXEL).toLong() + VOXEL_OFFSET) and 0x1FFFFF
-        return (idx(p.x) shl 42) or (idx(p.y) shl 21) or idx(p.z)
-    }
-
-    private fun voxelCentre(key: Long): Vec3 {
-        fun c(i: Long) = ((i - VOXEL_OFFSET) + 0.5f) * VOXEL
-        return Vec3(c((key ushr 42) and 0x1FFFFF), c((key ushr 21) and 0x1FFFFF), c(key and 0x1FFFFF))
-    }
-
     /**
      * Floor height from points: the lowest well-filled 5 cm layer between
      * 0.6 m and 2.2 m below the phone (the floor is the largest flat area
@@ -1722,7 +1850,10 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
      * furniture).
      */
     private fun estimateFloor(pts: List<Vec3>, camY: Float): Float? {
-        val lo = camY - 2.2f
+        // No lower than 1.85 m under the phone: nobody holds it higher. Depth
+        // noise under desks made a "floor" 2.2 m down, so every line drawn
+        // and the room height were wrong.
+        val lo = camY - 1.85f
         val bins = IntArray(32)
         var n = 0
         for (p in pts) {
@@ -1736,6 +1867,9 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         val best = smooth.max()
         if (best < 40) return null
         val i = smooth.indices.first { smooth[it] >= maxOf(40, (best * 0.4f).toInt()) }
+        // At the bottom of the range: the points go on below it, so this is
+        // the edge of depth noise, not a floor (a floor has little under it).
+        if (i <= 1) return null
         // Centre of the layer around that bin.
         var sum = 0f
         var cnt = 0
@@ -1878,22 +2012,17 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
 
     // ------------------------------------------------------------ measuring logic
 
-    private fun autoHeight(snap: Snapshot?): Float? {
-        val f = snap?.floorY ?: return null
-        val c = snap.ceilingY ?: return null
-        val h = c - f
-        return if (h in 1.8f..5f) h else null
-    }
-
-    private fun roomHeight(): Float? =
-        heightMarks.lastOrNull() ?: autoHeight(snapshot) ?: snapshot?.autoRoom?.height
-
     /** The automatic room is used unless the user marked corners by hand. */
     /** The automatic outline is used unless Corners mode was chosen. */
     private fun useAutoRoom() = !manualOutline
 
+    /** Steadies the crosshair's point over the last few frames (UI thread). */
+    private val aimSmoother = AimSmoother()
+
     private fun resolveAim(snap: Snapshot): Aim? {
-        val hit = snap.hit ?: return null
+        // Held still, the median of the last few frames' hits: one frame's
+        // depth / tracking noise no longer goes into the measurement.
+        val hit = snap.hit?.let { aimSmoother.point(it) } ?: return null
         if (mode == Mode.CORNER) {
             if (corners.size >= 3 && hit.dist2d(corners[0]) < 0.25f) return Aim(corners[0], true, true)
             val c = snap.cornerCandidates.minByOrNull { it.dist2d(hit) }
@@ -2128,6 +2257,12 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             resetAutoSearch()
         }
         autoOpeningKind = kind
+        // Auto (room) mode also counts the doors and windows it sees.
+        val roomScan = mode == Mode.AUTO && !lineOnly && !completing
+        if (roomScan != roomOpeningScan) {
+            roomOpeningScan = roomScan
+            roomConsensus.values.forEach { it.clear() }
+        }
     }
 
     /** The frame drawn on the camera view: the hand-adjusted one, else the
@@ -2148,9 +2283,28 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
     }
 
     /**
-     * A finger down at ([x], [y]) on the [w] x [h] camera view: grabs a
-     * corner circle of the door / window frame shown (or, away from them,
-     * one of its lines). The frame then stays as the user leaves it.
+     * Where the finger at ([x], [y]) on the [w] x [h] camera view meets the
+     * wall of [f]: (u along the wall, height), or null when the line of
+     * sight runs (nearly) along the wall or the hit is behind / too far.
+     */
+    private fun wallHit(f: WallFrame, x: Float, y: Float, w: Int, h: Int): FloatArray? {
+        if (w <= 0 || h <= 0) return null
+        val snap = snapshot ?: return null
+        val ray = screenRay(snap.viewProj, 2f * x / w - 1f, 1f - 2f * y / h) ?: return null
+        val n = f.normal
+        val den = ray.dir.x * n.x + ray.dir.z * n.z
+        if (abs(den) < 0.05f) return null
+        val t = ((f.origin.x - ray.origin.x) * n.x + (f.origin.z - ray.origin.z) * n.z) / den
+        if (t <= 0.1f || t > 15f) return null
+        val p = ray.origin + ray.dir * t
+        return floatArrayOf(f.uOf(p), p.y)
+    }
+
+    /**
+     * A finger down at ([x], [y]) on the [w] x [h] camera view: grabs one
+     * side of the door / window frame shown, by its handle (the circle in
+     * the middle of each side) or anywhere along its line. The frame then
+     * stays as the user leaves it.
      */
     private fun grabOpening(x: Float, y: Float, w: Int, h: Int): Boolean {
         if (!autoOpening()) return false
@@ -2158,74 +2312,36 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         val (c, frame) = shownOpening() ?: return false
         val corners = listOf(c.a, c.b, c.b.withY(c.topY), c.a.withY(c.topY))
         val s = corners.map { viewPoint(snap.viewProj, it, w, h) }
-        var best = -1
-        var bestD = dp(32f)
-        for ((i, p) in s.withIndex()) {
-            if (p == null) continue
-            val d = kotlin.math.hypot(p[0] - x, p[1] - y)
-            if (d < bestD) {
-                bestD = d
-                best = i
-            }
-        }
-        if (best < 0) {
-            // A line: corner i to i + 1 is the bottom, right, top, left edge.
-            bestD = dp(24f)
-            for (i in 0 until 4) {
-                val p = s[i] ?: continue
-                val q = s[(i + 1) % 4] ?: continue
-                val dx = q[0] - p[0]
-                val dy = q[1] - p[1]
-                val len2 = dx * dx + dy * dy
-                val t = if (len2 > 0f) (((x - p[0]) * dx + (y - p[1]) * dy) / len2).coerceIn(0f, 1f) else 0f
-                val d = kotlin.math.hypot(p[0] + dx * t - x, p[1] + dy * t - y)
-                if (d < bestD) {
-                    bestD = d
-                    best = 4 + i
-                }
-            }
-        }
-        if (best < 0) return false
-        if (adjusted == null) {
-            adjusted = AdjustedOpening(frame, c.left, c.right, c.bottom, c.top, c.estimated)
+        val side = OpeningFrameAdjust.pickSide(s, x, y, dp(36f), dp(24f))
+        if (side < 0) return false
+        val adj = adjusted ?: AdjustedOpening(frame, c.left, c.right, c.bottom, c.top, c.estimated).also {
+            adjusted = it
             diag("opening auto: adjusting by hand")
         }
-        adjustGrab = best
+        // Keep where the side is relative to the finger: the side follows
+        // the finger's movement from here, instead of jumping onto it.
+        val hit = wallHit(adj.frame, x, y, w, h)
+        adjustOffset = if (hit == null) 0f else OpeningFrameAdjust.sideValue(side, adj.left, adj.right, adj.bottom, adj.top) -
+            (if (side == OpeningFrameAdjust.LEFT || side == OpeningFrameAdjust.RIGHT) hit[0] else hit[1])
+        adjustGrab = side
         return true
     }
 
-    /** The grabbed circle or line follows the finger at ([x], [y]), on the
-     *  wall the frame lies on. */
+    /** The held side follows the finger at ([x], [y]) on the wall the frame
+     *  lies on. Only that side moves. */
     private fun dragOpening(x: Float, y: Float, w: Int, h: Int) {
         val adj = adjusted ?: return
         val g = adjustGrab
-        if (g < 0 || w <= 0 || h <= 0) return
-        val snap = snapshot ?: return
-        val ray = screenRay(snap.viewProj, 2f * x / w - 1f, 1f - 2f * y / h) ?: return
-        val f = adj.frame
-        val n = f.normal
-        val den = ray.dir.x * n.x + ray.dir.z * n.z
-        if (abs(den) < 0.05f) return
-        val t = ((f.origin.x - ray.origin.x) * n.x + (f.origin.z - ray.origin.z) * n.z) / den
-        if (t <= 0.1f || t > 15f) return
-        val p = ray.origin + ray.dir * t
-        val u = f.uOf(p)
-        val v = p.y
-        val gap = 0.10f // smallest width / height
-        fun left() { adj.left = kotlin.math.min(u, adj.right - gap) }
-        fun right() { adj.right = max(u, adj.left + gap) }
-        fun bottom() { adj.bottom = kotlin.math.min(v, adj.top - gap) }
-        fun top() { adj.top = max(v, adj.bottom + gap) }
-        when (g) {
-            0 -> { left(); bottom() }
-            1 -> { right(); bottom() }
-            2 -> { right(); top() }
-            3 -> { left(); top() }
-            4 -> bottom()
-            5 -> right()
-            6 -> top()
-            7 -> left()
-        }
+        if (g < 0) return
+        val hit = wallHit(adj.frame, x, y, w, h) ?: return
+        val along = g == OpeningFrameAdjust.LEFT || g == OpeningFrameAdjust.RIGHT
+        val e = OpeningFrameAdjust.moveSide(
+            g, (if (along) hit[0] else hit[1]) + adjustOffset, adj.left, adj.right, adj.bottom, adj.top,
+        )
+        adj.left = e[0]
+        adj.right = e[1]
+        adj.bottom = e[2]
+        adj.top = e[3]
     }
 
     private fun resetAutoSearch() {
@@ -2241,7 +2357,12 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
 
     /** An automatic attempt is back from [openingExecutor]. */
     private fun onOpeningResult(r: OpeningResult) {
-        if (isFinishing || r.gen != scanGeneration || !autoOpening() || r.kind != autoKindShown) return
+        if (isFinishing || r.gen != scanGeneration) return
+        if (mode == Mode.AUTO) {
+            onRoomOpeningResult(r)
+            return
+        }
+        if (!autoOpening() || r.kind != autoKindShown) return
         val now = SystemClock.uptimeMillis()
         val wall = r.wall
         if (wall == null) {
@@ -2281,12 +2402,67 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         }
     }
 
+    /** Centres of the doors / windows of [type] counted so far. */
+    private fun openingCentres(type: Int) = openings.map {
+        if (it.type != type) Vec3(Float.MAX_VALUE, 0f, Float.MAX_VALUE)
+        else RoomOpeningCounter.centre(it.a, it.b, it.baseY, it.topY ?: (it.baseY + 1f))
+    }
+
+    /**
+     * Room scan (Auto mode): a door / window attempt is back. Once the
+     * detections of one hold steady, have a door's or window's proportions
+     * and are not one already counted, it is added: the room's doors and
+     * windows are counted as it is walked round, with no tap needed.
+     */
+    private fun onRoomOpeningResult(r: OpeningResult) {
+        if (!roomOpeningScan || completing) return
+        val wall = r.wall ?: return
+        val c = r.detection?.candidate ?: return
+        val consensus = roomConsensus.getValue(r.kind)
+        val st = consensus.add(wall.frame, c)
+        if (!st.stable) return
+        val found = st.candidate
+        val type = if (r.kind == OpeningKind.DOOR) TYPE_DOOR else TYPE_WINDOW
+        val name = if (type == TYPE_DOOR) "Door" else "Window"
+        // Counted without a tap, so only on firm ground: the floor known (a
+        // window's sill and a door's foot are checked against it) and a size
+        // a real one has. Small "windows" counted on a guessed floor were
+        // posters and panels.
+        val floorY = snapshot?.floorY
+        if (floorY == null || found.width < ROOM_MIN_OPENING || found.height < ROOM_MIN_OPENING ||
+            !RoomOpeningCounter.plausible(r.kind, found, floorY)
+        ) {
+            consensus.clear()
+            return
+        }
+        val centre = RoomOpeningCounter.centre(found.a, found.b, found.bottom, found.top)
+        // Already counted (as either kind: a glazed door must not count twice).
+        if (RoomOpeningCounter.duplicateOf(centre, openingCentres(TYPE_DOOR)) >= 0 ||
+            RoomOpeningCounter.duplicateOf(centre, openingCentres(TYPE_WINDOW)) >= 0
+        ) {
+            consensus.clear()
+            return
+        }
+        openings.add(OpeningMark(type, found.a, found.b, found.topY, METHOD_AUTO, found.estimated))
+        history.add(H_OPENING_AUTO)
+        consensus.clear()
+        diag(
+            "room scan: ${name.lowercase()} counted automatically " +
+                "${sizeText(found.width, found.height)} (${wall.source}${if (found.estimated) ", estimated" else ""}), " +
+                (elementsSummary() ?: ""),
+        )
+        flash("$name found: ${if (found.estimated) "≈ " else ""}${sizeText(found.width, found.height)}  ·  ${elementsSummary()}")
+        overlay.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        overlay.invalidate()
+    }
+
     /**
      * Mark button in Door / Window: adds the door / window found: the stable
      * result (or one that was stable a moment ago), else the detection so
      * far, flagged as approximate. With nothing detected it says where to
-     * point. An added one finishes the scan straight away (the app then
-     * shows its 2D front view with every dimension).
+     * point. The scan goes on, so every door and window of the room can be
+     * added (and counted); one already counted at the same spot is replaced
+     * rather than counted twice. Finish ends the scan.
      */
     private fun acceptAutoOpening() {
         val now = SystemClock.uptimeMillis()
@@ -2318,8 +2494,18 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         val type = if (mode == Mode.DOOR) TYPE_DOOR else TYPE_WINDOW
         val est = c.estimated || !settled
         val o = OpeningMark(type, c.a, c.b, c.topY, METHOD_AUTO, est)
-        openings.add(o)
-        history.add(H_OPENING_AUTO)
+        // The same door / window counted already (e.g. found during the
+        // room scan): this one, as accepted or adjusted, replaces it.
+        val dup = RoomOpeningCounter.duplicateOf(
+            RoomOpeningCounter.centre(c.a, c.b, c.bottom, c.top), openingCentres(type),
+        )
+        val replaced = dup >= 0
+        if (replaced) {
+            openings[dup] = o
+        } else {
+            openings.add(o)
+            history.add(H_OPENING_AUTO)
+        }
         val size = (if (est) "≈ " else "") + sizeText(c.width, c.height)
         diag(
             "${openingName()} ${openings.size} (auto, ${lastOpeningResult?.wall?.source}" +
@@ -2334,13 +2520,12 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) HapticFeedbackConstants.CONFIRM
             else HapticFeedbackConstants.LONG_PRESS,
         )
-        // Finish now, as the Finish button does, so the drawing opens with
-        // everything measured in this scan.
-        onDone(focusOpening = openings.lastIndex)
-        if (!isFinishing) {
-            flash("${mode.label} added: $size" + if (settled) "" else ". The frame had not settled: check its size on the plan.")
-            overlay.invalidate()
-        }
+        // The scan goes on: point at the next door / window, or tap Finish.
+        flash(
+            "${mode.label} ${if (replaced) "updated" else "added"}: $size  ·  ${elementsSummary()}" +
+                if (settled) "" else ". The frame had not settled: check its size on the plan.",
+        )
+        overlay.invalidate()
     }
 
     /**
@@ -2409,7 +2594,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         val name = openingName()
         val now = SystemClock.uptimeMillis()
         return when {
-            adjusted != null -> "Drag the circles or lines onto the $name's frame, then tap ✓. Undo goes back to automatic."
+            adjusted != null -> "Drag a side's circle (or its line) onto the $name's frame: only that side moves. Then tap ✓. Undo goes back to automatic."
             autoNoWall -> "Point at the wall around the $name so it can be found."
             autoStable() -> "${mode.label} found. Tap ✓ to add it."
             autoFresh(now) -> "Hold still…"
@@ -2509,19 +2694,20 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                     // Looked around without moving: not said once every wall
                     // is measured anyway.
                     snap.sectorCount >= 4 && snap.moveExtent < 0.4f && (room == null || room.estimatedCount > 0) ->
-                        "Don't turn on the spot. Walk slowly along the walls with the phone facing them: the camera measures distance from sideways movement."
+                        "Walls aren't measured by turning on the spot: walk slowly along them with the phone facing them. " +
+                            "Or tap Corners to mark each corner from where you stand."
                     snap.wallCount == 0 && room == null ->
-                        "Walk slowly around the room, about 1–2 m from the walls, with the phone facing the wall. Keep the floor's edge in view. White dots show what is being measured."
+                        "Walk slowly around the room, about 1–2 m from the walls, with the phone facing the wall. Keep the floor's edge in view. Doors and windows in view are counted automatically."
                     room == null ->
                         "Keep walking along the walls. The outline appears once enough of them are measured."
                     room.estimatedCount > 0 ->
                         "Room found. ${room.estimatedCount} dashed side${if (room.estimatedCount == 1) " is" else "s are"} estimated. Point the camera at ${if (room.estimatedCount == 1) "that wall" else "those walls"} to measure ${if (room.estimatedCount == 1) "it" else "them"}, or tap Finish."
-                    else -> "All walls found. Tap Finish to create the floor plan, or keep scanning to refine it."
+                    else -> "All walls found${elementsSummary()?.let { " ($it)" } ?: ""}. Tap Finish, or point at any door or window not counted yet."
                 }
             }
             Mode.CORNER -> when (corners.size) {
                 0 -> "Aim the crosshair where two walls meet the floor, then tap the button to mark the first corner."
-                1, 2 -> "Walk to the next corner, going around the room in order, and mark it."
+                1, 2 -> "Aim at the next corner, going round the room in order, and mark it. You can stay where you are."
                 else -> "Mark the next corner. To close the room, aim at the first corner or tap Finish."
             }
             Mode.DOOR -> when {
@@ -2550,7 +2736,6 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                     else "Slide the phone to the second point WITHOUT turning it, with the SAME corner on the point (not the other side of the phone), and tap."
                 } else if (pendingLine == null) "Tap the first point on the screen, or aim the crosshair at it and press the button."
                 else "Tap the second point. The distance updates as you move."
-            Mode.HEIGHT -> "Aim at the ceiling close to a wall and tap the button to measure the room height."
         }
     }
 
@@ -2566,6 +2751,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
     // ------------------------------------------------------------ UI thread
 
     private fun onFrame() {
+        snapshot?.let { s -> aimSmoother.add(SystemClock.uptimeMillis(), s.hit?.takeIf { s.tracking }) }
         snapshot?.let { s ->
             if (s.tracking != lastTrackingLogged) {
                 lastTrackingLogged = s.tracking
@@ -2704,21 +2890,6 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                 val touch = lineMethod == LineMethod.TOUCH
                 if (!placeLinePoint(aim.p, !touch && snap.hitEstimated, if (touch) "touch" else "aim")) return
             }
-            Mode.HEIGHT -> {
-                val floor = snap.floorY
-                if (floor == null) {
-                    flash("Detect the floor first.")
-                    return
-                }
-                val h = aim.p.y - floor
-                if (h < 1.5f || h > 6f) {
-                    flash("That point is ${m(h)} above the floor. Aim at the ceiling.")
-                    return
-                }
-                heightMarks.add(h)
-                history.add(H_HEIGHT)
-                flash("Room height: ${m(h)}")
-            }
         }
         markButton.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
         overlay.invalidate()
@@ -2765,7 +2936,6 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                 pendingLineEstimated = l.aEstimated
                 switchModeQuietly(Mode.LINE)
             }
-            H_HEIGHT -> heightMarks.removeAt(heightMarks.lastIndex)
             else -> return
         }
         flash("Undone")
@@ -2831,7 +3001,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
 
     private fun onReset() {
         cancelAutoComplete("start over")
-        val hasData = corners.isNotEmpty() || openings.isNotEmpty() || heightMarks.isNotEmpty() ||
+        val hasData = corners.isNotEmpty() || openings.isNotEmpty() ||
             pendingOpening != null || surfaces.isNotEmpty() || lines.isNotEmpty() || pendingLine != null ||
             snapshot?.autoRoom != null || photos.isNotEmpty()
         if (!hasData) {
@@ -2840,7 +3010,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         }
         AlertDialog.Builder(this)
             .setTitle("Start over?")
-            .setMessage("This clears the room outline, every door, window, surface, line and height measured and the photos taken, and scans the room again.")
+            .setMessage("This clears the room outline, every door, window, surface and line measured and the photos taken, and scans the room again.")
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Start over") { _, _ -> resetScan() }
             .show()
@@ -2853,6 +3023,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
      */
     private fun resetScan() {
         scanGeneration++
+        furniture.clear()
         // Stop the GL thread before touching its state.
         glView.onPause()
         session?.let {
@@ -2889,13 +3060,13 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         lastWallSource = null
         acceptedCentre = null
         resetAutoSearch()
+        roomConsensus.values.forEach { it.clear() }
         surfaces.clear()
         pendingSurface.clear()
         lines.clear()
         pendingLine = null
         clearTap()
         tapMissUntil = 0L
-        heightMarks.clear()
         history.clear()
         captureRequested = false
         deletePhotos()
@@ -2916,11 +3087,38 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
      * [openings] of the door / window just added with ✓, which the app shows
      * first.
      */
-    private fun onDone(focusOpening: Int? = null) {
+    private fun onDone(focusOpening: Int? = null, confirmed: Boolean = false) {
         // Finish tapped while the checkmark shows: finish once, now.
         handler.removeCallbacks(autoFinish)
         val snap = snapshot
         val auto = snap?.autoRoom
+        // An automatic outline that is mostly guesswork (half its sides or
+        // more estimated) is not saved without asking: plain walls the
+        // camera can't measure gave rooms like 4.6 × 0.9 m. Marking the
+        // corners works there.
+        val noWalls = snap != null && snap.wallCount == 0
+        if (!confirmed && !lineOnly && useAutoRoom() && auto != null && (mostlyEstimated(auto) || noWalls)) {
+            if (weakFinishDialog?.isShowing == true) return
+            val measured = (auto.corners.size - auto.estimatedCount).coerceAtLeast(0)
+            diag("finish: outline unreliable (estimated ${auto.estimatedCount} of ${auto.corners.size}, walls ${snap?.wallCount}), asking")
+            val why = if (mostlyEstimated(auto)) {
+                "Only $measured of ${auto.corners.size} walls were measured; the rest of this outline is a guess"
+            } else {
+                "No wall was measured directly; this outline only comes from the edges of the floor and ceiling"
+            }
+            weakFinishDialog = AlertDialog.Builder(this)
+                .setTitle("Room not measured yet")
+                .setMessage(
+                    "$why, so its size is probably wrong.\n\nPlain walls are hard for the camera. Mark the " +
+                        "corners instead: stand in the room, aim at each corner where the walls meet the floor " +
+                        "and tap +.",
+                )
+                .setPositiveButton("Mark corners") { _, _ -> onMode(Mode.CORNER) }
+                .setNeutralButton("Save anyway") { _, _ -> onDone(focusOpening, confirmed = true) }
+                .setNegativeButton("Keep scanning", null)
+                .show()
+            return
+        }
         // Measuring distances only: no outline is needed, none is returned.
         // The result holds distances only, no room: asked for at the start,
         // or lines were measured in a normal scan before any room outline
@@ -2970,8 +3168,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                 outline.joinToString(" ") { String.format("(%.2f,%.2f)", it.x, it.z) } +
                 (auto?.takeIf { autoOutline }?.let {
                     String.format(" %.2f x %.2f m, estimated sides %d", it.width, it.depth, it.estimatedCount)
-                } ?: "") + ", openings ${openings.size}, surfaces ${surfaces.size}, lines ${lines.size}, " +
-                "height ${roomHeight()}",
+                } ?: "") + ", openings ${openings.size}, surfaces ${surfaces.size}, lines ${lines.size}",
         )
         fun d(v: Float) = v.toDouble()
         val data = Intent()
@@ -3008,7 +3205,16 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             .putExtra(EXTRA_OPENING_ESTIMATED, openings.map { if (it.estimated) 1 else 0 }.toIntArray())
             .putExtra(EXTRA_LINE_ONLY, linesOnly)
         data.putExtra(EXTRA_PHOTOS, photos.toTypedArray())
-        roomHeight()?.let { data.putExtra(EXTRA_HEIGHT, it.toDouble()) }
+        if (!linesOnly) {
+            val found = furniture.confirmed()
+            data.putExtra(
+                EXTRA_ELEMENTS,
+                found.flatMap {
+                    listOf(d(it.center.x), d(it.center.z), d(it.width), d(it.depth), d(it.height), d(it.yaw))
+                }.toDoubleArray(),
+            )
+            data.putExtra(EXTRA_ELEMENT_KINDS, found.map { it.kind }.toTypedArray())
+        }
         snap?.floorY?.let { data.putExtra(EXTRA_FLOOR_Y, it.toDouble()) }
         focusOpening?.takeIf { it in openings.indices }?.let {
             diag("finish: focus on opening $it")
@@ -3106,7 +3312,6 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             parts.add("Area ${area2(area())}")
             parts.add("Perimeter ${m(perimeter())}")
         }
-        roomHeight()?.let { parts.add("Height ${m(it)}") }
         return parts.joinToString(sep)
     }
 
@@ -3147,6 +3352,11 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             !tracking -> "Initializing"
             completing -> "Room scanned ✓"
             mode == Mode.AUTO && autoReady -> "All walls found  ·  hold steady…"
+            mode == Mode.AUTO && room != null && room.corners.size >= 4 && room.estimatedCount == 0 &&
+                !lookedRound(snap) -> {
+                val around = (snap.sectorCount * 100f / SECTORS / 5f).roundToInt() * 5
+                "All walls found  ·  turn round for doors & windows  ·  $around%"
+            }
             // Auto-finish is off (card tapped away, or Corners was used).
             mode == Mode.AUTO && room != null && room.corners.size >= 4 && room.estimatedCount == 0 ->
                 "All walls found  ·  tap Finish"
@@ -3159,7 +3369,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                 }
             }
             mode == Mode.LINE -> "Distance  ·  ${lines.size} line${if (lines.size == 1) "" else "s"}"
-            snap?.floorY == null && snap?.autoRoom != null -> "Room found  ·  tilt down to the floor for height"
+            snap?.floorY == null && snap?.autoRoom != null -> "Room found  ·  tilt down to the floor"
             snap?.floorY == null -> "Scanning  ·  include some floor"
             else -> {
                 val w = snap.wallCount
@@ -3261,7 +3471,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             mode == Mode.AUTO && !manualOutline && !cornersChosen &&
             snap.tracking &&
             pendingEdge == null && pendingOpening == null && pendingSurface.isEmpty() && pendingLine == null &&
-            room.corners.size >= 4
+            room.corners.size >= 4 && !mostlyEstimated(room)
         if (!eligible || snap == null || room == null) {
             stableSince = now
             stableCorners = -1
@@ -3285,34 +3495,43 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         }
         val steady = now - stableSince
         val floorKnown = snap.floorY != null
+        // Doors and windows are only counted on walls the camera has looked
+        // at: finishing as soon as the walls were found (often from a few
+        // corners) ended the scan before most of them had been in view.
+        val lookedRound = lookedRound(snap)
         val rule = when {
-            est == 0 && floorKnown && steady >= AUTO_STABLE_MS -> "a"
-            est == 0 && !floorKnown && steady >= AUTO_STABLE_NO_FLOOR_MS -> "b"
-            snap.sectorCount >= SECTORS - 1 && snap.moveExtent >= 0.8f &&
+            est == 0 && floorKnown && lookedRound && steady >= AUTO_STABLE_MS -> "a"
+            est == 0 && !floorKnown && lookedRound && steady >= AUTO_STABLE_NO_FLOOR_MS -> "b"
+            // Some walls measured as walls, not only outlined from the floor
+            // and ceiling edges: turning on the spot gave a different room
+            // size every time from those alone.
+            snap.sectorCount >= SECTORS - 1 && snap.moveExtent >= 0.8f && snap.wallCount >= 2 &&
                 est <= (if (room.corners.size == 4) 1 else 2) && steady >= AUTO_STABLE_ROUND_MS -> "c"
             else -> null
         }
         if (rule != null) startAutoComplete(room, snap, rule)
-        return est == 0
+        return est == 0 && lookedRound
     }
+
+    /** The camera has looked nearly all the way round the room (every wall
+     *  in view at some point), so its doors and windows had their chance. */
+    private fun lookedRound(snap: Snapshot) = snap.sectorCount >= LOOK_ROUND_SECTORS
 
     /** Shows the checkmark and finishes after [AUTO_FINISH_DELAY_MS] unless cancelled. */
     private fun startAutoComplete(room: AutoRoom, snap: Snapshot, rule: String) {
         completing = true
-        val h = roomHeight()
-        val size = String.format("%.2f × %.2f m  ·  Area %.2f m²", room.width, room.depth, room.area) +
-            (h?.let { String.format("  ·  Height %.2f m", it) } ?: "")
+        val size = String.format("%.2f × %.2f m  ·  Area %.2f m²", room.width, room.depth, room.area)
         val est = room.estimatedCount
         val notes = listOfNotNull(
             if (est > 0) "$est wall${if (est == 1) "" else "s"} estimated — check ${if (est == 1) "it" else "them"} on the plan" else null,
-            if (h == null) "Height not measured" else null,
+            elementsSummary(),
         )
         diag(
             "auto-complete: room scanned (rule $rule), " + String.format(
-                "%d corners %.2f x %.2f m, area %.2f m², height %s, estimated sides %d, %d/%d sectors, extent %.1f m",
+                "%d corners %.2f x %.2f m, area %.2f m², estimated sides %d, %d/%d sectors, extent %.1f m",
                 room.corners.size, room.width, room.depth, room.area,
-                h?.let { String.format("%.2f", it) } ?: "-", est, snap.sectorCount, SECTORS, snap.moveExtent,
-            ),
+                est, snap.sectorCount, SECTORS, snap.moveExtent,
+            ) + ", ${elementsSummary() ?: "no doors or windows"}",
         )
         completeSize.text = size
         completeNote.text = notes.joinToString("  ·  ")
@@ -3350,26 +3569,29 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
 
     /**
      * The measurements line under the camera view, for the selected mode:
-     * the room in Auto and Corners, the marked openings in Door and Window,
-     * the room height in Height.
+     * the room in Auto and Corners (with the doors and windows counted so
+     * far), the marked openings in Door and Window.
      */
     private fun statsLine(auto: AutoRoom?): String {
         val sep = "   ·   "
         return when (mode) {
             Mode.AUTO -> {
-                if (auto == null) return "Measuring the room..."
+                val counts = elementsSummary()
+                if (auto == null) return "Measuring the room..." + (counts?.let { "$sep$it" } ?: "")
                 val parts = mutableListOf(
                     "${m(auto.width)} × ${m(auto.depth)}",
                     "Area ${String.format("%.2f m²", auto.area)}",
                     "Perimeter ${m(auto.perimeter)}",
+                    "${auto.corners.size} walls",
                 )
-                roomHeight()?.let { parts.add("Height ${m(it)}") }
+                counts?.let { parts.add(it) }
                 parts.joinToString(sep)
             }
             Mode.CORNER -> {
                 val parts = mutableListOf("${corners.size} corner${if (corners.size == 1) "" else "s"}")
                 if (corners.size >= 2) parts.add("Perimeter ${m(perimeter())}")
                 if (corners.size >= 3) parts.add("Area ${String.format("%.2f m²", area())}")
+                elementsSummary()?.let { parts.add(it) }
                 parts.joinToString(sep)
             }
             Mode.DOOR, Mode.WINDOW -> {
@@ -3390,8 +3612,18 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                     "  ·  " + area2(surfaces.sumOf { (it.width * it.height).toDouble() }.toFloat())
             }
             Mode.LINE -> linesSummary()
-            Mode.HEIGHT -> roomHeight()?.let { "Room height ${m(it)}" } ?: "Room height not measured yet"
         }
+    }
+
+    /** "2 doors · 3 windows" for what this scan has found so far (marked,
+     *  accepted or detected automatically); null when there are none. */
+    private fun elementsSummary(): String? {
+        val doors = openings.count { it.type == TYPE_DOOR }
+        val windows = openings.count { it.type == TYPE_WINDOW }
+        val things = if (mode == Mode.AUTO) furniture.confirmed().size else 0
+        if (doors == 0 && windows == 0 && things == 0) return null
+        return "$doors door${if (doors == 1) "" else "s"} · $windows window${if (windows == 1) "" else "s"}" +
+            if (things > 0) " · $things object${if (things == 1) "" else "s"}" else ""
     }
 
     private fun setIfChanged(tv: TextView, text: String) {
@@ -3612,6 +3844,9 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         for (md in Mode.values()) {
             // Surface measuring is hidden from the camera.
             if (md == Mode.SURFACE) continue
+            // Measuring distances only: no room outline is returned, so the
+            // room modes (whose result would be thrown away) are not offered.
+            if (lineOnly && (md == Mode.AUTO || md == Mode.CORNER)) continue
             val tv = TextView(this).apply {
                 text = md.label
                 typeface = fontSemiBold
@@ -3803,6 +4038,24 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             pathEffect = DashPathEffect(floatArrayOf(dp(8f), dp(9f)), 0f)
             strokeWidth = dp(2.5f)
         }
+        /** Auto scan: the white lines along the walls found (drawLiveWalls). */
+        private val liveWall = Paint(line).apply {
+            strokeWidth = dp(4f)
+            color = Color.WHITE
+        }
+        private val liveWallDash = Paint(liveWall).apply {
+            pathEffect = DashPathEffect(floatArrayOf(dp(10f), dp(8f)), 0f)
+        }
+        /** A soft dark edge so the white lines show on light walls too. */
+        private val liveShadow = Paint(line).apply {
+            strokeWidth = dp(7f)
+            color = Color.argb(80, 0, 0, 0)
+        }
+        /** Furniture boxes in the live view: thinner white lines. */
+        private val liveThin = Paint(line).apply {
+            strokeWidth = dp(2f)
+            color = Color.argb(220, 255, 255, 255)
+        }
         private val dot = Paint(Paint.ANTI_ALIAS_FLAG)
         private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -3858,6 +4111,62 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         }
         private val path = Path()
 
+        // Live 2D plan (room scan).
+        /** Where the plan / the mini-map was last drawn (taps toggle them). */
+        val planRect = android.graphics.RectF()
+        val miniRect = android.graphics.RectF()
+        private val planBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(240, 11, 20, 38) }
+        private val planGrid = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dp(1f)
+            color = Color.argb(22, 255, 255, 255)
+        }
+        private val planWall = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dp(6f)
+            strokeCap = Paint.Cap.SQUARE
+            strokeJoin = Paint.Join.MITER
+            color = Color.WHITE
+        }
+        private val planEst = Paint(planWall).apply {
+            strokeWidth = dp(3f)
+            strokeCap = Paint.Cap.BUTT
+            color = DOOR
+            pathEffect = DashPathEffect(floatArrayOf(dp(7f), dp(5f)), 0f)
+        }
+        /** Wall surfaces seen so far (before / beside the room outline). */
+        private val planSeen = Paint(planWall).apply {
+            strokeWidth = dp(4f)
+            strokeCap = Paint.Cap.ROUND
+            color = Color.argb(110, 150, 175, 255)
+        }
+        /** Cuts the wall open where a door or window is (plan background). */
+        private val gap = Paint(planWall).apply {
+            color = Color.rgb(11, 20, 38)
+            strokeWidth = dp(8f)
+            strokeCap = Paint.Cap.BUTT
+        }
+        private val planThin = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dp(2f)
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        private val planText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 15f, resources.displayMetrics)
+            typeface = fontSemiBold
+            fontFeatureSettings = "tnum"
+        }
+        private val planSub = Paint(planText).apply {
+            color = Color.argb(170, 255, 255, 255)
+            textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 12f, resources.displayMetrics)
+            typeface = Typeface.DEFAULT
+        }
+        private val planLen = Paint(label).apply {
+            textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 11f, resources.displayMetrics)
+        }
+
         init {
             setLayerType(LAYER_TYPE_SOFTWARE, null) // for the crosshair shadow
         }
@@ -3875,7 +4184,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         private var adjustPointer = -1
 
         /** Door / Window: the orange frame found can be dragged into place,
-         *  by its corner circles or its lines. Returns whether it took [e]. */
+         *  one side at a time, by its handle or its line. Returns whether it took [e]. */
         private fun adjustTouch(e: MotionEvent): Boolean {
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -3905,6 +4214,16 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         @SuppressLint("ClickableViewAccessibility")
         override fun onTouchEvent(e: MotionEvent): Boolean {
             if (autoOpening() && adjustTouch(e)) return true
+            // Room scan: a tap on the 2D plan shows the camera overlay with
+            // the small map; a tap on that map brings the plan back.
+            if (e.actionMasked == MotionEvent.ACTION_DOWN && (mode == Mode.AUTO || mode == Mode.CORNER) && !lineOnly &&
+                (planRect.contains(e.x, e.y) || miniRect.contains(e.x, e.y))
+            ) {
+                planBig = !planBig
+                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                invalidate()
+                return true
+            }
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     // Not handled in other modes: as before, nothing happens.
@@ -4107,16 +4426,23 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             val cy = height / 2f
             val vp = snap.viewProj
 
+            planRect.setEmpty()
+            miniRect.setEmpty()
+            // Room scan with the 2D plan: the camera image stays clear; what
+            // was found is drawn on the plan.
+            val plan2d = !forPhoto && livePlanShown()
             if (forPhoto) {
                 if (useAutoRoom() && !lineOnly) snap.autoRoom?.let { drawAutoRoom(canvas, snap, it) }
-            } else if (snap.tracking) {
+            } else if (snap.tracking && !(plan2d && mode == Mode.AUTO)) {
+                // Corner mode keeps these with its plan: they are aimed at.
                 drawSurfaces(canvas, snap)
                 drawFramePoints(canvas, snap)
                 if (mode == Mode.CORNER) drawCornerCandidates(canvas, snap)
-                // The automatic outline and its side lengths only in Auto mode,
-                // so the measurements on screen are those of the current mode.
-                if (mode == Mode.AUTO) snap.autoRoom?.let { drawAutoRoom(canvas, snap, it) }
             }
+            // Auto room scan: the walls, corners, doors, windows and
+            // furniture outlined in white on the camera image as they are
+            // found (lengths are on the plan).
+            if (!forPhoto && snap.tracking && mode == Mode.AUTO && !lineOnly) drawLiveWalls(canvas, snap)
             val touch = touchLine()
             val touchOp = touchOpening()
             val autoOp = autoOpening()
@@ -4156,6 +4482,8 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             // window's base is its sill, so it stays where it was tapped.
             fun base(o: OpeningMark, p: Vec3) = if (o.type == TYPE_DOOR) onFloor(p) else p
             for (o in openings) {
+                // Auto scan: drawn as white frames by drawLiveWalls.
+                if (mode == Mode.AUTO && !forPhoto && !lineOnly) break
                 val colour = if (o.type == TYPE_DOOR) DOOR else WINDOW
                 val a0 = base(o, o.a)
                 val b0 = base(o, o.b)
@@ -4220,7 +4548,6 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                 Mode.WINDOW -> pendingEdge
                 Mode.SURFACE -> pendingSurface.singleOrNull()
                 Mode.LINE -> pendingLine
-                Mode.HEIGHT -> null
             }
             // While a finger is down the line follows it instead (drawTap).
             val tapping = mode == Mode.LINE && !touch && tapShown()
@@ -4274,12 +4601,8 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                 }
                 canvas.drawCircle(s[0], s[1], dp(4f), dot)
             }
-            if (mode == Mode.HEIGHT && aim != null && fy != null) {
-                chip(canvas, cx, cy - dp(34f), "${m(aim.p.y - fy)} above floor")
-            }
-
             if (mode == Mode.AUTO) {
-                drawMiniMap(canvas, null)
+                if (plan2d) drawLivePlan(canvas, snap) else drawMiniMap(canvas, null)
                 return
             }
 
@@ -4336,7 +4659,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                 }
             }
             if (mode == Mode.LINE) drawTap(canvas, snap)
-            drawMiniMap(canvas, aim)
+            if (plan2d && mode == Mode.CORNER) drawLivePlan(canvas, snap, aim) else drawMiniMap(canvas, aim)
         }
 
         /** Thin ring, centre dot and four short ticks, with a soft shadow. */
@@ -4376,20 +4699,25 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             val corners = listOf(a, b, bt, at)
             val g = adjustGrab
             for (i in 0 until 4) {
-                // The line being dragged (or both lines at a dragged corner) in blue.
-                val held = g == 4 + i || g == i || g == (i + 1) % 4
-                paint.color = if (hand && held && g >= 0) ACCENT else colour
+                // Side i runs from corner i to i + 1; the one held in blue.
+                paint.color = if (hand && g == i) ACCENT else colour
                 segment(canvas, vp, corners[i], corners[(i + 1) % 4], paint)
             }
             paint.color = colour
-            for ((i, p) in corners.withIndex()) {
+            // Corners: small dots only (dragging a corner moved two sides).
+            for (p in corners) {
                 val s = project(vp, p) ?: continue
-                // Bigger circles to grab; the held one in blue.
-                val r = if (hand) dp(9f) else dp(6f)
+                dot.color = colour
+                canvas.drawCircle(s[0], s[1], dp(3.5f), dot)
+            }
+            // One handle per side, at its middle: it moves that side only.
+            for (i in 0 until 4) {
+                val s = project(vp, (corners[i] + corners[(i + 1) % 4]) * 0.5f) ?: continue
+                val r = if (hand && g == i) dp(12f) else dp(10f)
                 dot.color = Color.WHITE
                 canvas.drawCircle(s[0], s[1], r, dot)
                 dot.color = if (hand && g == i) ACCENT else colour
-                canvas.drawCircle(s[0], s[1], r - dp(2f), dot)
+                canvas.drawCircle(s[0], s[1], r - dp(2.5f), dot)
             }
             var text = (if (c.estimated) "≈ " else "") + sizeText(c.width, c.height)
             if (mode == Mode.WINDOW) c.sill?.let { text += " · sill ${m(it)}" }
@@ -4464,6 +4792,78 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             }
         }
 
+        /**
+         * Auto room scan, drawn like a room scanner's live view: every wall
+         * found so far outlined in white on the camera image (where it meets
+         * the floor, where it meets the ceiling, and up each end, so the
+         * corners are white lines floor to ceiling), doors and windows as
+         * white frames, and furniture as white boxes. It grows wall by wall
+         * as the user turns round the room; once the room's outline is found,
+         * that is drawn instead (sides not measured dashed).
+         */
+        private fun drawLiveWalls(canvas: Canvas, snap: Snapshot) {
+            val vp = snap.viewProj
+            val room = snap.autoRoom
+            val wallPlanes = snap.planes.filter { it.kind == Surface.WALL }
+            val fy = snap.floorY ?: room?.corners?.firstOrNull()?.y
+                ?: wallPlanes.flatMap { it.points }.minOfOrNull { it.y } ?: return
+            val segs: List<Pair<Vec3, Vec3>>
+            val est: List<Boolean>
+            if (room != null && room.corners.size >= 3) {
+                val n = room.corners.size
+                segs = (0 until n).map { room.corners[it].withY(fy) to room.corners[(it + 1) % n].withY(fy) }
+                est = (0 until n).map { room.estimated[it] }
+            } else {
+                val (lines, _) = LivePlan.connectWalls(
+                    LivePlan.mergeWalls(wallPlanes.mapNotNull { LivePlan.wallLine(it.points) }),
+                )
+                segs = lines.map { it.first.withY(fy) to it.second.withY(fy) }
+                est = segs.map { false }
+            }
+            // The top: the ceiling when found, otherwise as high as the walls
+            // have been seen (once that is clearly more than a skirting).
+            val top = snap.ceilingY?.takeIf { it - fy > 1.5f }
+                ?: wallPlanes.flatMap { it.points }.maxOfOrNull { it.y }?.takeIf { it - fy > 1.2f }
+            fun edge(a: Vec3, b: Vec3, dashed: Boolean = false) {
+                val (p, q) = projectSegment(vp, a, b) ?: return
+                canvas.drawLine(p[0], p[1], q[0], q[1], liveShadow)
+                canvas.drawLine(p[0], p[1], q[0], q[1], if (dashed) liveWallDash else liveWall)
+            }
+            for ((i, s) in segs.withIndex()) {
+                val (a, b) = s
+                edge(a, b, est[i])
+                if (top != null) {
+                    edge(a.withY(top), b.withY(top), est[i])
+                    edge(a, a.withY(top))
+                    edge(b, b.withY(top))
+                } else {
+                    // Not seen high enough yet: short posts at the ends.
+                    edge(a, a.withY(fy + 0.5f))
+                    edge(b, b.withY(fy + 0.5f))
+                }
+            }
+            // Doors and windows: a white frame in their wall.
+            for (o in openings) {
+                val a = if (o.type == TYPE_DOOR) o.a.withY(fy) else o.a
+                val b = if (o.type == TYPE_DOOR) o.b.withY(fy) else o.b
+                val t = o.topY ?: continue
+                edge(a, b)
+                edge(a, a.withY(t))
+                edge(b, b.withY(t))
+                edge(a.withY(t), b.withY(t))
+            }
+            // Furniture found by the AI detector: a white box.
+            for (f in furniture.confirmed()) {
+                val base = FurnitureTracker.footprint(f).map { it.withY(fy) }
+                val up = base.map { it.withY(fy + f.height) }
+                for (k in 0 until 4) {
+                    segment(canvas, vp, base[k], base[(k + 1) % 4], liveThin)
+                    segment(canvas, vp, up[k], up[(k + 1) % 4], liveThin)
+                    segment(canvas, vp, base[k], up[k], liveThin)
+                }
+            }
+        }
+
         private fun drawCornerCandidates(canvas: Canvas, snap: Snapshot) {
             val vp = snap.viewProj
             val fy = snap.floorY
@@ -4496,6 +4896,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
             val left = if (landscape) topBox.left.toFloat() else width - size - dp(16f)
             val top = topBox.bottom + dp(12f)
             canvas.drawRoundRect(left, top, left + size, top + size, dp(16f), dp(16f), mapBg)
+            if ((mode == Mode.AUTO || mode == Mode.CORNER) && !lineOnly) miniRect.set(left, top, left + size, top + size)
             val hb = mapBorder.strokeWidth / 2
             canvas.drawRoundRect(left + hb, top + hb, left + size - hb, top + size - hb, dp(16f) - hb, dp(16f) - hb, mapBorder)
 
@@ -4579,6 +4980,307 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
                 canvas.drawCircle(px, py, dp(3.5f), dot)
             }
         }
+
+        /**
+         * Room scan: the live 2D floor plan, in the lower part of the screen
+         * (landscape: the right half), heading-up so the wall in front of the
+         * phone is at its top. It shows the wall surfaces as they are picked
+         * up, the room outline once there is one (measured walls solid with
+         * their lengths, estimated ones amber and dashed), doors with their
+         * swing and windows as found, the phone with its field of view and the
+         * directions looked at so far, and the room's size and counts.
+         */
+        private fun drawLivePlan(canvas: Canvas, snap: Snapshot, aim: Aim? = null) {
+            val landscape = width > height
+            // Corner mode keeps the crosshair (screen centre) and its hints
+            // clear: the plan starts further down (landscape: further right).
+            val cornerMode = mode == Mode.CORNER
+            val bottom = (if (panelBox.visibility == VISIBLE) panelBox.top.toFloat() else height.toFloat()) - dp(10f)
+            val left: Float
+            val right: Float
+            val top: Float
+            if (landscape) {
+                left = width * if (cornerMode) 0.62f else 0.5f
+                right = width - dp(12f) - insets[2]
+                top = dp(12f) + insets[1]
+            } else {
+                left = dp(12f) + insets[0]
+                right = width - dp(12f) - insets[2]
+                top = max(topBox.bottom + dp(12f), if (cornerMode) height / 2f + dp(72f) else height * 0.40f)
+            }
+            if (bottom - top < dp(140f) || right - left < dp(140f)) {
+                drawMiniMap(canvas, aim)
+                return
+            }
+            planRect.set(left, top, right, bottom)
+            val radius = dp(20f)
+            canvas.drawRoundRect(planRect, radius, radius, planBg)
+            canvas.drawRoundRect(planRect, radius, radius, mapBorder)
+            canvas.save()
+            canvas.clipRect(planRect)
+
+            val header = dp(52f)
+            // Corner mode: the walls marked so far, each drawn with its length
+            // as it is marked, and a live line to the crosshair.
+            val marking = mode == Mode.CORNER
+            val marked = this@ArMeasureActivity.corners.map { it.withY(0f) }
+            val room = if (marking) null else snap.autoRoom
+            val corners = if (marking) marked else room?.corners ?: emptyList()
+            val seen = if (snap.tracking) {
+                LivePlan.mergeWalls(
+                    snap.planes.filter { it.kind == Surface.WALL }.mapNotNull { LivePlan.wallLine(it.points) },
+                )
+            } else emptyList()
+            val floors = snap.planes.filter { it.kind == Surface.FLOOR }
+            val aimP = if (marking) aim?.p?.withY(0f) else null
+            val pts = ArrayList<Vec3>()
+            pts.addAll(corners)
+            for ((a, b) in seen) { pts.add(a); pts.add(b) }
+            for (o in openings) { pts.add(o.a); pts.add(o.b) }
+            aimP?.let { pts.add(it) }
+            val fwd = snap.camForward
+            val t = LivePlan.fit(pts, snap.camPos, fwd, left, top + header, right, bottom, dp(26f))
+            fun x(p: Vec3) = t.x(p)
+            fun y(p: Vec3) = t.y(p)
+
+            // 1 m grid, turning with the plan.
+            val reach = (max(right - left, bottom - top) / t.scale).toInt() + 2
+            val gx0 = kotlin.math.floor(t.cx).toInt()
+            val gz0 = kotlin.math.floor(t.cz).toInt()
+            for (k in -reach..reach) {
+                val gx = (gx0 + k).toFloat()
+                val gz = (gz0 + k).toFloat()
+                val z0 = (gz0 - reach).toFloat()
+                val z1 = (gz0 + reach).toFloat()
+                val x0 = (gx0 - reach).toFloat()
+                val x1 = (gx0 + reach).toFloat()
+                canvas.drawLine(t.x(gx, z0), t.y(gx, z0), t.x(gx, z1), t.y(gx, z1), planGrid)
+                canvas.drawLine(t.x(x0, gz), t.y(x0, gz), t.x(x1, gz), t.y(x1, gz), planGrid)
+            }
+
+            // Floor scanned so far.
+            fill.color = FLOOR_FILL
+            for (f in floors) {
+                if (f.points.size < 3) continue
+                path.reset()
+                for ((i, p) in f.points.withIndex()) if (i == 0) path.moveTo(x(p), y(p)) else path.lineTo(x(p), y(p))
+                path.close()
+                canvas.drawPath(path, fill)
+            }
+
+            // Room outline.
+            val n = corners.size
+            var mx = 0f
+            var mz = 0f
+            for (c in corners) { mx += c.x; mz += c.z }
+            // The user stands in the room, so before there is an outline the
+            // phone is on the inside.
+            val inside = if (n >= 3) Vec3(mx / n, 0f, mz / n) else snap.camPos
+            val icx = x(inside)
+            val icy = y(inside)
+
+            // Walls found so far. Before the outline (Auto) they are drawn as
+            // walls, each with its length, the moment they are found; once
+            // there is an outline (or while marking) they stay faint.
+            val seenAsWalls = !marking && n < 3
+            if (seenAsWalls) {
+                for ((a, b) in seen) canvas.drawLine(x(a), y(a), x(b), y(b), planWall)
+            } else {
+                planSeen.alpha = 70
+                for ((a, b) in seen) canvas.drawLine(x(a), y(a), x(b), y(b), planSeen)
+            }
+
+            if (marking && n >= 2) {
+                // Marked walls, the room not closed yet: solid, and dashed
+                // back to the first corner once it could be closed.
+                for (i in 1 until n) {
+                    canvas.drawLine(x(corners[i - 1]), y(corners[i - 1]), x(corners[i]), y(corners[i]), planWall)
+                }
+                if (n >= 3) {
+                    planThin.color = Color.argb(170, 255, 255, 255)
+                    planThin.pathEffect = DashPathEffect(floatArrayOf(dp(5f), dp(5f)), 0f)
+                    canvas.drawLine(x(corners.last()), y(corners.last()), x(corners[0]), y(corners[0]), planThin)
+                    planThin.pathEffect = null
+                }
+            } else if (n >= 3) {
+                path.reset()
+                for ((i, c) in corners.withIndex()) if (i == 0) path.moveTo(x(c), y(c)) else path.lineTo(x(c), y(c))
+                path.close()
+                fill.color = Color.argb(26, 255, 255, 255)
+                canvas.drawPath(path, fill)
+                for (i in 0 until n) {
+                    val a = corners[i]
+                    val b = corners[(i + 1) % n]
+                    val est = room!!.estimated[i]
+                    canvas.drawLine(x(a), y(a), x(b), y(b), if (est) planEst else planWall)
+                }
+            }
+
+            // Furniture found by the AI detector: its footprint and name.
+            if (!marking) {
+                for (f in furniture.confirmed()) {
+                    val fp = FurnitureTracker.footprint(f)
+                    path.reset()
+                    for ((i, p) in fp.withIndex()) if (i == 0) path.moveTo(x(p), y(p)) else path.lineTo(x(p), y(p))
+                    path.close()
+                    fill.color = Color.argb(40, 255, 255, 255)
+                    canvas.drawPath(path, fill)
+                    planThin.color = Color.argb(150, 255, 255, 255)
+                    canvas.drawPath(path, planThin)
+                    val fm = planSub.fontMetrics
+                    canvas.drawText(
+                        f.kind, x(f.center) - planSub.measureText(f.kind) / 2,
+                        y(f.center) - (fm.ascent + fm.descent) / 2, planSub,
+                    )
+                }
+            }
+
+            // Doors and windows: the wall cut open, then their symbol.
+            for (o in openings) {
+                val ax = x(o.a)
+                val ay = y(o.a)
+                val bx = x(o.b)
+                val by = y(o.b)
+                canvas.drawLine(ax, ay, bx, by, gap)
+                if (o.type == TYPE_DOOR) {
+                    val (leaf, arc) = LivePlan.doorSwing(o.a, o.b, inside)
+                    planThin.color = DOOR
+                    planThin.pathEffect = null
+                    canvas.drawLine(ax, ay, x(leaf), y(leaf), planThin)
+                    path.reset()
+                    for ((i, p) in arc.withIndex()) if (i == 0) path.moveTo(x(p), y(p)) else path.lineTo(x(p), y(p))
+                    planThin.pathEffect = DashPathEffect(floatArrayOf(dp(3f), dp(3f)), 0f)
+                    canvas.drawPath(path, planThin)
+                    planThin.pathEffect = null
+                } else {
+                    // Two thin lines along the wall, closed at the ends.
+                    val l = kotlin.math.hypot(bx - ax, by - ay)
+                    if (l < 1f) continue
+                    val nx = -(by - ay) / l * dp(3.5f)
+                    val ny = (bx - ax) / l * dp(3.5f)
+                    planThin.color = WINDOW
+                    path.reset()
+                    path.moveTo(ax + nx, ay + ny); path.lineTo(bx + nx, by + ny)
+                    path.lineTo(bx - nx, by - ny); path.lineTo(ax - nx, ay - ny); path.close()
+                    canvas.drawPath(path, planThin)
+                    canvas.drawLine(ax, ay, bx, by, planThin)
+                }
+            }
+
+            // A wall's length in a pill beside its middle, on the side away
+            // from the room.
+            fun lengthLabel(a: Vec3, b: Vec3, text: String, bg: Int) {
+                val sx = (x(a) + x(b)) / 2
+                val sy = (y(a) + y(b)) / 2
+                // Away from the inside along the wall's normal on screen.
+                val lx = x(b) - x(a)
+                val ly = y(b) - y(a)
+                val l = kotlin.math.hypot(lx, ly)
+                if (l < dp(18f)) return
+                var nx = -ly / l
+                var ny = lx / l
+                if ((icx - sx) * nx + (icy - sy) * ny > 0) { nx = -nx; ny = -ny }
+                val w = planLen.measureText(text) / 2 + dp(7f)
+                val cx = sx + nx * dp(16f)
+                val cy = sy + ny * dp(16f)
+                labelBg.color = bg
+                canvas.drawRoundRect(cx - w, cy - dp(10f), cx + w, cy + dp(10f), dp(10f), dp(10f), labelBg)
+                val fm = planLen.fontMetrics
+                canvas.drawText(text, cx, cy - (fm.ascent + fm.descent) / 2, planLen)
+            }
+            val labelInk = Color.argb(230, 30, 41, 59)
+
+            // Wall lengths, outside the room.
+            if (marking) {
+                for (i in 1 until n) lengthLabel(corners[i - 1], corners[i], m(corners[i - 1].dist2d(corners[i])), labelInk)
+            } else if (n >= 3) {
+                for (i in 0 until n) {
+                    val est = room!!.estimated[i]
+                    val text = m(room.side(i)) + if (est) " ?" else ""
+                    lengthLabel(corners[i], corners[(i + 1) % n], text, if (est) DOOR_DEEP else labelInk)
+                }
+            } else if (seenAsWalls) {
+                for ((a, b) in seen) lengthLabel(a, b, m(a.dist2d(b)), labelInk)
+            }
+
+            // Corner mode: the wall being measured, from the last corner to
+            // the crosshair, with its length as it changes; marked corners.
+            if (marking) {
+                val last = corners.lastOrNull()
+                if (aimP != null && last != null) {
+                    planThin.color = SNAP
+                    planThin.strokeWidth = dp(3f)
+                    planThin.pathEffect = DashPathEffect(floatArrayOf(dp(7f), dp(5f)), 0f)
+                    canvas.drawLine(x(last), y(last), x(aimP), y(aimP), planThin)
+                    planThin.pathEffect = null
+                    planThin.strokeWidth = dp(2f)
+                    lengthLabel(last, aimP, m(last.dist2d(aimP)), SNAP_DEEP)
+                }
+                dot.color = ACCENT
+                for (c in corners) canvas.drawCircle(x(c), y(c), dp(4.5f), dot)
+                if (aimP != null) {
+                    ring.color = if (aim?.snappedCorner == true || aim?.closesRoom == true) SNAP else Color.WHITE
+                    canvas.drawCircle(x(aimP), y(aimP), dp(6f), ring)
+                }
+            }
+
+            // The phone: its field of view (forward is always up), the
+            // directions looked at so far round it, and a dot.
+            if (snap.tracking) {
+                val px = x(snap.camPos)
+                val py = y(snap.camPos)
+                val reachFov = dp(70f)
+                val half = reachFov * 0.58f // tan 30°
+                path.reset()
+                path.moveTo(px, py)
+                path.lineTo(px - half, py - reachFov)
+                path.lineTo(px + half, py - reachFov)
+                path.close()
+                fill.shader = android.graphics.LinearGradient(
+                    px, py, px, py - reachFov, Color.argb(110, 47, 91, 255), Color.argb(0, 47, 91, 255),
+                    android.graphics.Shader.TileMode.CLAMP,
+                )
+                canvas.drawPath(path, fill)
+                fill.shader = null
+                // Sector i covers world directions from -180° + 30° i (atan2(z, x)).
+                val r = dp(22f)
+                val step = 360f / SECTORS
+                for (i in 0 until SECTORS) {
+                    val a = Math.toRadians((-180.0 + (i + 0.5) * step)).toFloat()
+                    val wx = snap.camPos.x + cos(a)
+                    val wz = snap.camPos.z + sin(a)
+                    val ang = Math.toDegrees(atan2((t.y(wx, wz) - py).toDouble(), (t.x(wx, wz) - px).toDouble())).toFloat()
+                    mapArc.color = if (snap.sectors and (1 shl i) != 0) SNAP else Color.argb(60, 255, 255, 255)
+                    canvas.drawArc(px - r, py - r, px + r, py + r, ang - step / 2 + 3f, step - 6f, false, mapArc)
+                }
+                dot.color = Color.WHITE
+                canvas.drawCircle(px, py, dp(8f), dot)
+                dot.color = ACCENT
+                canvas.drawCircle(px, py, dp(5.5f), dot)
+            }
+            canvas.restore()
+
+            // Header: size and area, then what was counted.
+            val tx = left + dp(16f)
+            val title = if (marking) {
+                when {
+                    n == 0 -> "Aim at a corner on the floor and mark it"
+                    n == 1 -> "Now aim at the next corner"
+                    else -> {
+                        var total = 0f
+                        for (i in 1 until n) total += corners[i - 1].dist2d(corners[i])
+                        "${n - 1} wall${if (n == 2) "" else "s"}  ·  ${m(total)}" +
+                            if (n >= 3) "  ·  ${area2(LivePlan.area(corners))}" else ""
+                    }
+                }
+            } else if (room != null && n >= 3) {
+                "${m(room.width)} × ${m(room.depth)}  ·  ${area2(LivePlan.area(corners))}"
+            } else if (seen.isNotEmpty()) "${seen.size} wall${if (seen.size == 1) "" else "s"} found"
+            else "Point at the walls to start the plan"
+            canvas.drawText(title, tx, top + dp(24f), planText)
+            val counts = elementsSummary() ?: "No doors or windows yet"
+            canvas.drawText("$counts  ·  tap for camera", tx, top + dp(42f), planSub)
+        }
     }
 
     companion object {
@@ -4600,11 +5302,12 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         private const val AUTO_STABLE_ROUND_MS = 8000L
         /** Yaw sectors (30° each) used to tell how far round the user has looked. */
         private const val SECTORS = 12
+        /** Sectors (of [SECTORS]) seen before a room scan finishes by itself. */
+        private const val LOOK_ROUND_SECTORS = SECTORS - 2
         /** How long the checkmark shows (and can be tapped away) before finishing. */
         private const val AUTO_FINISH_DELAY_MS = 800L
         const val EXTRA_XS = "xs"
         const val EXTRA_ZS = "zs"
-        const val EXTRA_HEIGHT = "height"
         const val EXTRA_OPENINGS = "openings"
         /** Floor height (world y), only when known. */
         const val EXTRA_FLOOR_Y = "floorY"
@@ -4619,6 +5322,11 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         /** Int array, 0 / 1 per line in [EXTRA_LINES] order: 1 when an end of
          *  the line was estimated rather than measured. Always present. */
         const val EXTRA_LINES_ESTIMATED = "linesEstimated"
+        /** Furniture found by the AI detector: 6 values each (centre x, z,
+         *  width, depth, height, yaw: the direction of its width as
+         *  atan2(z, x)), with its kind in [EXTRA_ELEMENT_KINDS]. */
+        const val EXTRA_ELEMENTS = "elements"
+        const val EXTRA_ELEMENT_KINDS = "elementKinds"
         /** True when started with [EXTRA_START_MODE] "line": xs / zs are empty. */
         const val EXTRA_LINE_ONLY = "lineOnly"
         /** Int: index (in the openings order) of the door / window just
@@ -4643,7 +5351,6 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         private const val MAX_CLOUD = 40000
         private const val MAX_VOXELS = 150000
         private const val VOXEL = 0.05f
-        private const val VOXEL_OFFSET = 1L shl 20
         /** cos² of 15°: how far from a tapped direction scan points count. */
         private const val COS2_15 = 0.9330127f
 
@@ -4658,7 +5365,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         private const val H_EDGE = 1
         /** Door / window kept without its top (mode switch or Finish). */
         private const val H_OPENING = 2
-        private const val H_HEIGHT = 3
+        // 3 was the removed room-height mark.
         /** Door / window: second side marked, waiting for the top. */
         private const val H_OPENING_BASE = 4
         /** Door / window: top marked, opening complete. */
@@ -4684,6 +5391,12 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
          *  stays shown, how long without one before giving advice, how long
          *  an accepted one is not offered again. */
         private const val OPENING_INTERVAL_MS = 200L
+        /** Room scan: door / window attempts alternate kinds at this pace. */
+        private const val ROOM_OPENING_INTERVAL_MS = 250L
+        /** Room scan: smallest door / window side counted automatically (m). */
+        private const val ROOM_MIN_OPENING = 0.5f
+        /** How often the camera image goes to the AI furniture detector. */
+        private const val FURNITURE_INTERVAL_MS = 700L
         private const val AUTO_FRESH_MS = 1500L
 
         /** A tap this soon after the result was stable still adds it. */
@@ -4699,7 +5412,7 @@ class ArMeasureActivity : Activity(), GLSurfaceView.Renderer {
         /** topY in [EXTRA_OPENING_DETAILS] when no top was marked. */
         private const val NO_TOP = -999.0
 
-        // Planora palette.
+        // ECM-AI palette.
         /** Ink #0B1426: text on white, the base of every panel. */
         private val INK = Color.rgb(11, 20, 38)
         /** Ink 2 #16213A: raised surfaces on ink. */

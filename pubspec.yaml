@@ -34,12 +34,18 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  roomplan_flutter: ^0.3.0+3
+  # Vendored (MIT): its scanning screen shows the camera with a live 2D floor
+  # plan instead of RoomPlan's 3D view. See packages/roomplan_flutter.
+  roomplan_flutter:
+    path: packages/roomplan_flutter
   path_provider: ^2.1.6
   pdf: ^3.13.1
   printing: ^5.15.1
   vector_math: ^2.4.4
   image_picker: ^1.2.4
+  share_plus: ^13.3.1
+  panorama_viewer: ^3.0.0
+  flutter_reactive_ble: ^5.6.0
 
 dev_dependencies:
   integration_test:
@@ -67,6 +73,11 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # The ECM-AI logo (full, and the robot mark cut from it).
+  assets:
+    - assets/images/ecm_ai_logo.png
+    - assets/images/ecm_ai_mark.png
 
   # Inter (SIL Open Font License, assets/fonts/Inter-LICENSE.txt): the same
   # type on Android and iOS.

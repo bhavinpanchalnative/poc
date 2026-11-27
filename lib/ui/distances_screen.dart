@@ -40,22 +40,51 @@ class _DistancesScreenState extends State<DistancesScreen> {
   }
 
   Future<void> _measure() async {
-    List<MeasuredLine>? got;
+    ({List<MeasuredLine> lines, List<SavedOpening> openings})? result;
     try {
-      got = await RoomScanner.measureLines(first: lines.length + 1);
+      result = await RoomScanner.measureLines(first: lines.length + 1);
     } on ScanFailure catch (e) {
       if (mounted) showMessage(context, e.message);
       return;
     }
-    if (got == null || got.isEmpty || !mounted) return;
-    // The user names each line measured (mandatory).
+    if (result == null || !mounted) return;
+    var got = result.lines;
+    var doors = result.openings;
+    if (got.isEmpty && doors.isEmpty) return;
+    // The user names each line, door and window measured (mandatory), and
+    // says which room the doors / windows are in.
     final unit = AppSettings.unit.value;
+    String len(double m) => formatLength(m, unit);
+    final askRoom = doors.isNotEmpty;
+    final first = askRoom ? 1 : 0;
     final names = await askNames(context,
-        title: got.length == 1 ? 'Name this line' : 'Name your lines',
-        labels: [for (final l in got) 'Line · ${formatLength(l.length, unit)}']);
+        title: got.length + doors.length == 1
+            ? 'Name this ${got.isEmpty ? doors.first.type.label.toLowerCase() : 'line'}'
+            : 'Name your measurements',
+        labels: [
+          if (askRoom) 'Room',
+          for (final o in doors)
+            '${o.type.label} · ${len(o.width)}${o.height == null ? '' : ' × ${len(o.height!)}'}',
+          for (final l in got) 'Line · ${len(l.length)}',
+        ]);
     if (!mounted) return;
-    got = [for (var i = 0; i < got.length; i++) got[i].copyWith(name: names[i])];
-    setState(() => lines = [...got!.reversed, ...lines]);
+    doors = [
+      for (var i = 0; i < doors.length; i++)
+        doors[i].copyWith(name: names[first + i], room: names[0]),
+    ];
+    got = [
+      for (var i = 0; i < got.length; i++)
+        got[i].copyWith(name: names[first + doors.length + i]),
+    ];
+    if (doors.isNotEmpty) {
+      await OpeningStore.save([...doors.reversed, ...await OpeningStore.load()]);
+      if (mounted) {
+        showMessage(context,
+            'Saved to History: ${doors.length} ${doors.length == 1 ? 'door / window' : 'doors / windows'}.');
+      }
+    }
+    if (!mounted || got.isEmpty) return;
+    setState(() => lines = [...got.reversed, ...lines]);
     await LineStore.save(lines);
   }
 

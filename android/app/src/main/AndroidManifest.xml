@@ -2,10 +2,19 @@
     <!-- Camera measuring (ARCore). AR is optional: the app still installs on
          phones without it and offers manual entry instead. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Bluetooth laser meters (Leica DISTO). Android 12+: scan (not used
+         for location) and connect; older: Bluetooth and location to scan. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
     <uses-feature android:glEsVersion="0x00020000" android:required="true" />
     <application
-        android:label="Planora"
+        android:label="ECM-AI"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

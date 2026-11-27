@@ -7,13 +7,12 @@ import 'package:room_measure/engine/plan_editor.dart';
 import 'package:room_measure/engine/sample_rooms.dart';
 import 'package:room_measure/engine/units.dart';
 
-RoomScan rect(double w, double d, {double? height}) => RoomScan(
+RoomScan rect(double w, double d) => RoomScan(
       id: 't',
       name: 'Test',
       createdAt: DateTime(2026),
       source: CaptureSource.manual,
       walls: wallsFromLengths([w, d, w, d], [90, 90, 90, 90]),
-      height: height,
     );
 
 FloorPlan build(RoomScan s) => const FloorPlanBuilder().build(s);
@@ -48,8 +47,8 @@ void main() {
   });
 
   group('dimensions', () {
-    test('rectangle area, size, volume and wall area', () {
-      final s = rect(4, 3, height: 2.5)
+    test('rectangle area, size and element counts', () {
+      final s = rect(4, 3)
         ..openings.add(const Opening(
             type: OpeningType.door,
             wallIndex: 0,
@@ -61,9 +60,23 @@ void main() {
       expect(p.perimeter, closeTo(14, 1e-6));
       expect(p.overallSize.width, closeTo(4, 1e-6));
       expect(p.overallSize.depth, closeTo(3, 1e-6));
-      expect(p.volume, closeTo(30, 1e-6));
-      expect(p.grossWallArea, closeTo(35, 1e-6));
-      expect(p.netWallArea, closeTo(33, 1e-6));
+      // Ceiling height is no longer part of a room.
+      expect(s.toJson().containsKey('height'), isFalse);
+      s.elements.addAll(const [
+        RoomElement(kind: 'Bed'),
+        RoomElement(kind: 'Chair'),
+        RoomElement(kind: 'Chair'),
+      ]);
+      expect(roomElementCounts(s), [('Door', 1), ('Bed', 1), ('Chair', 2)]);
+      final back = RoomScan.fromJson(s.toJson());
+      expect(back.elements.map((e) => e.kind), ['Bed', 'Chair', 'Chair']);
+    });
+
+    test('old saves with a ceiling height still load', () {
+      final j = rect(4, 3).toJson()..['height'] = 2.6;
+      final back = RoomScan.fromJson(j);
+      expect(build(back).area, closeTo(12, 1e-6));
+      expect(back.elements, isEmpty);
     });
 
     test('sample scans close with the right size', () {

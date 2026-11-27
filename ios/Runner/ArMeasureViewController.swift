@@ -13,7 +13,7 @@ private let scanLog = Logger(subsystem: "com.nativesoftware.roomMeasure", catego
 ///  - measure: opens the scanner. With arguments {"startMode": "line"} it
 ///    opens as a plain distance measurer (Line mode, no room outline needed).
 ///    Returns nil when the user backs out, {error} on failure, or {xs, zs,
-///    openings, auto, estimated, height?, floorY?, openingDetails, surfaces,
+///    openings, auto, estimated, floorY?, openingDetails, surfaces,
 ///    lines, lineOnly, focusOpening?}.
 ///    xs and zs are empty (auto false, estimated 0) when the scan finished
 ///    with doors / windows but no room outline.
@@ -79,13 +79,15 @@ final class ArMeasurePlugin: NSObject, FlutterPlugin {
 ///
 /// ARKit's detected planes are classified into floor, walls and ceiling and
 /// drawn over the camera image. In Auto mode the room outline is found from
-/// the walls and tracked feature points (RoomDetector). Corners / Door /
-/// Window / Height modes let the user mark points with the crosshair.
+/// the walls and tracked feature points (RoomDetector); doors and windows
+/// in view are counted along the way. Corners / Door / Window / Surface /
+/// Line modes let the user mark points with the crosshair. No room height is
+/// measured or returned (the ceiling only helps tell walls from furniture).
 final class ArMeasureViewController: UIViewController, ARSessionDelegate {
 
   private enum Mode: Int, CaseIterable {
-    case auto, corner, door, window, surface, line, height
-    var label: String { ["Auto", "Corners", "Door", "Window", "Surface", "Line", "Height"][rawValue] }
+    case auto, corner, door, window, surface, line
+    var label: String { ["Auto", "Corners", "Door", "Window", "Surface", "Line"][rawValue] }
   }
 
   private enum SurfaceKind { case floor, wall, ceiling, other }
@@ -351,6 +353,17 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   /// Camera position and viewing direction of the last tracked frame.
   private var camNow: V3?
   private var camDir = V3(0, 0, -1)
+  /// Room scan (Auto mode): the live 2D floor plan fills the lower part of
+  /// the screen and the walls, doors and windows found are drawn on it
+  /// instead of over the camera image. Tapping the plan switches to the
+  /// camera overlay with the small mini-map, and back.
+  // The camera view, with the walls outlined in it, fills the screen, and
+  // the plan is a small map; tap the map for the big plan.
+  private var planBig = false
+  private var livePlanShown: Bool { (mode == .auto || mode == .corner) && !lineOnly && planBig }
+  /// Where the plan / the small map was last drawn (overlay coordinates).
+  private var planRect = CGRect.null
+  private var miniRect = CGRect.null
 
   private var sectorsCovered: Int { sectors.filter { $0 }.count }
   /// Diagonal of the box the camera has moved in, in metres.
@@ -414,6 +427,15 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   /// Detection runs here, at most one attempt at a time (see
   /// maybeDetectOpening).
   private let openingQueue = DispatchQueue(label: "room_measure.opening", qos: .userInitiated)
+
+  /// AI furniture detection runs here (its model is made, and used, only on
+  /// this queue); what it finds goes into `furniture` on the main thread.
+  private let furnitureQueue = DispatchQueue(label: "room_measure.furniture", qos: .utility)
+  private var furnitureModel: FurnitureModel?
+  private var furnitureModelFailed = false
+  private var furnitureBusy = false
+  private var lastFurnitureAttempt: CFTimeInterval = 0
+  private let furniture = FurnitureTracker()
   private var openingBusy = false
   private var lastOpeningAttempt: CFTimeInterval = 0
   /// Bumped whenever an attempt in flight must be thrown away (mode or
@@ -460,9 +482,23 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   }
 
   private var adjusted: AdjustedOpening?
-  /// What the finger holds: corners 0-3 (bottom-left, bottom-right,
-  /// top-right, top-left), edges 4-7 (bottom, right, top, left); -1 none.
+  /// The side the finger holds (OpeningFrameAdjust: 0 bottom, 1 right,
+  /// 2 top, 3 left); -1 none. Only that side moves.
   private var adjustGrab = -1
+  /// Where the held side was relative to the finger when grabbed (m along
+  /// the wall, or height), so it follows the finger without jumping.
+  private var adjustOffset: Float = 0
+
+  /// Room scan (Auto mode): doors and windows are looked for on whatever
+  /// wall is in view while the room is measured (both kinds in each image),
+  /// and counted once a detection holds steady.
+  private var roomOpeningScan: Bool { mode == .auto && !lineOnly && !completing && !completed }
+  /// Room scan: recent detections per kind (typeDoor / typeWindow), kept
+  /// apart from the Door / Window mode's own search.
+  private var roomSamples = [Int: [AutoSample]]()
+
+  /// Steadies the crosshair's point over the last few frames.
+  private var aimSmoother = AimSmoother()
 
   /// The frame drawn on the camera view: the hand-adjusted one, else the
   /// detection.
@@ -485,7 +521,6 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   private var lastTapPick: CFTimeInterval = 0
   /// A tap where no depth could be told: a red ring stays there briefly.
   private var failedTap: (at: CGPoint, until: Date)?
-  private var heightMarks = [Float]()
   private var history = [Int]()
   private var flashMessage: String?
   private var flashUntil = Date.distantPast
@@ -784,7 +819,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
         }
       }
     default:
-      finishWithError("Camera permission is needed to scan a room. Allow it in Settings > Planora.")
+      finishWithError("Camera permission is needed to scan a room. Allow it in Settings > ECM-AI.")
     }
   }
 
@@ -865,7 +900,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
 
   func session(_ session: ARSession, didFailWithError error: Error) {
     if let e = error as? ARError, e.code == .cameraUnauthorized {
-      finishWithError("Camera permission is needed to scan a room. Allow it in Settings > Planora.")
+      finishWithError("Camera permission is needed to scan a room. Allow it in Settings > ECM-AI.")
     } else {
       finishWithError("The camera scanner stopped: \(error.localizedDescription)")
     }
@@ -1031,7 +1066,18 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
         hit = r.point
         hitEstimated = r.estimated
       }
-      if openingAuto && !completed { maybeDetectOpening(frame, polys: polys) }
+      if openingAuto && !completed {
+        maybeDetectOpening(frame, polys: polys, kind: mode == .door ? .door : .window, room: false)
+      } else if roomOpeningScan {
+        // Room scan: doors and windows are found along the way, both looked
+        // for in each image (a little less often, so the room detection
+        // keeps its share of the phone). They used to alternate, which
+        // halved how often each was seen while the camera swept past.
+        maybeDetectOpening(frame, polys: polys, kind: .door, room: true)
+        // AI furniture detection, once the floor is known (furniture is
+        // placed where it stands on it).
+        if let fy = planeFloorY ?? pointFloorY { maybeDetectFurniture(frame, floorY: fy, orientation: orientation) }
+      }
     }
     // A finger held still still points at something else as the phone moves.
     if let tp = tapPreview, CACurrentMediaTime() - lastTapPick >= 1.0 / 30 {
@@ -1045,6 +1091,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       camUp: V3(t.columns.1.x, t.columns.1.y, t.columns.1.z), planes: outlines, floorY: planeFloorY ?? pointFloorY, ceilingY: ceilingY,
       wallCount: wallCount, cornerCandidates: cornerCandidates, autoRoom: autoRoom,
       framePoints: framePoints)
+    aimSmoother.add(CACurrentMediaTime(), tracking ? hit : nil)
 
     if tracking != lastTracking {
       lastTracking = tracking
@@ -1515,21 +1562,28 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   /// Starts a detection attempt on this frame (about 5 a second, one at a
   /// time). The wall plane is found here, on the main queue; reading the
   /// camera image and the detection itself run on openingQueue.
-  private func maybeDetectOpening(_ frame: ARFrame, polys: [(anchor: ARPlaneAnchor, local: [V3])]) {
+  /// `room`: a room-scan attempt (Auto mode, counting doors and windows),
+  /// whose result goes to noteRoomOpening instead of the Door / Window
+  /// search. Returns whether an attempt slot was used (started, or no wall).
+  @discardableResult
+  private func maybeDetectOpening(_ frame: ARFrame, polys: [(anchor: ARPlaneAnchor, local: [V3])],
+                                  kind: OpeningKind, room: Bool) -> Bool {
     let now = CACurrentMediaTime()
-    if openingBusy || now - lastOpeningAttempt < 0.2 { return }
+    if openingBusy || now - lastOpeningAttempt < (room ? 0.25 : 0.2) { return false }
     lastOpeningAttempt = now
     guard let (wall, source) = autoWallFrame(frame, polys: polys) else {
+      if room { return true }
       if !autoWallMissing { diag("auto \(mode.label.lowercased()): no wall plane") }
       autoWallMissing = true
       // The detections so far are kept: an estimated wall often drops out
       // for a frame or two, and clearing them then meant the result never
       // stayed stable long enough to be added. They expire after 2 s.
-      return
+      return true
     }
-    if autoWallMissing { diag("auto \(mode.label.lowercased()): wall from \(source)") }
-    autoWallMissing = false
-    let kind: OpeningKind = mode == .door ? .door : .window
+    if !room {
+      if autoWallMissing { diag("auto \(mode.label.lowercased()): wall from \(source)") }
+      autoWallMissing = false
+    }
     let camera = frame.camera
     let k = camera.intrinsics
     let model = CameraModel(
@@ -1542,11 +1596,33 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     let gen = openingGen
     openingBusy = true
     openingQueue.async { [weak self] in
-      let result = Self.detectOpening(buffer, model, wall, kind)
+      let result = Self.detectOpening(buffer, model, wall, kind, wide: room)
+      // Room scan: the same image and wall searched for a window too. A
+      // window's wall guessed through the floor is of no use unless the floor
+      // line confirmed it (as below).
+      var roomDoor: OpeningCandidate?
+      var roomWindow: OpeningCandidate?
+      if room, let result {
+        if result.floorLine != nil || source != "floor" {
+          roomWindow = OpeningDetector.search(kind: .window, frame: result.frame, image: result.image).candidate
+        }
+        roomDoor = result.analysis.candidate
+        if let d = roomDoor, RoomOpeningCounter.doorIsWindow(d, roomWindow, floorY: result.frame.floorY) {
+          roomDoor = nil
+        }
+      }
       DispatchQueue.main.async {
         guard let self else { return }
         self.openingBusy = false
-        guard gen == self.openingGen, self.openingAuto, !self.completed, let result else { return }
+        guard gen == self.openingGen, !self.completed, let result else { return }
+        if room {
+          if self.roomOpeningScan {
+            self.noteRoomOpening(roomDoor, kind: .door, wall: result.frame)
+            self.noteRoomOpening(roomWindow, kind: .window, wall: result.frame)
+          }
+          return
+        }
+        guard self.openingAuto else { return }
         // The wall is placed by where it meets the floor when that line is in
         // view (OpeningDetector.measure): a detected wall a few cm out, or a
         // guessed one, made the door / window that much too small or large.
@@ -1567,12 +1643,13 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
                                             kind: kind))
       }
     }
+    return true
   }
 
   /// Resamples the camera image's luminance (the Y plane) onto the wall and
   /// looks for the frame. Runs on openingQueue.
   private static func detectOpening(_ buf: CVPixelBuffer, _ model: CameraModel, _ wall: WallFrame,
-                                    _ kind: OpeningKind) -> OpeningDetector.Measured? {
+                                    _ kind: OpeningKind, wide: Bool = false) -> OpeningDetector.Measured? {
     CVPixelBufferLockBaseAddress(buf, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
     let planar = CVPixelBufferIsPlanar(buf)
@@ -1587,7 +1664,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     // on current devices, scaled in case it ever differs.
     let sx = Float(pw) / Float(model.width), sy = Float(ph) / Float(model.height)
     let maxX = Float(pw - 1), maxY = Float(ph - 1)
-    return OpeningDetector.measure(kind: kind, frame: wall, camera: model) { x, y in
+    return OpeningDetector.measure(kind: kind, frame: wall, camera: model, wide: wide) { x, y in
       let fx = x * sx, fy = y * sy
       if !(fx >= 0 && fy >= 0 && fx <= maxX && fy <= maxY) { return nil }
       let x0 = min(Int(fx), pw - 2), y0 = min(Int(fy), ph - 2)
@@ -1613,6 +1690,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   private func resetAutoSearch() {
     openingGen += 1
     clearAutoSamples()
+    roomSamples.removeAll()
     autoWallMissing = false
     autoNothingSince = Date()
   }
@@ -1654,7 +1732,11 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     }
   }
 
-  private static func consensus(_ samples: [AutoSample]) -> AutoOpening? {
+  /// Room scan: there the camera sweeps past a door or window instead of
+  /// being held on it, so 4 detections within 2 cm (about 2 s held still)
+  /// were seldom reached and nothing was counted. 3 within 4 cm still
+  /// rejects one-off misreads (as OpeningConsensus.forRoomScan on Android).
+  private static func consensus(_ samples: [AutoSample], tol: Float = 0.02, need: Int = 4) -> AutoOpening? {
     if samples.isEmpty { return nil }
     func median(_ v: [Float]) -> Float {
       let s = v.sorted()
@@ -1664,19 +1746,72 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     let top = median(samples.map { $0.top })
     let a = V3(median(samples.map { $0.a.x }), bottom, median(samples.map { $0.a.z }))
     let b = V3(median(samples.map { $0.b.x }), bottom, median(samples.map { $0.b.z }))
-    let tol: Float = 0.02
     let agree = samples.filter {
       $0.a.dist2d(a) <= tol && $0.b.dist2d(b) <= tol && abs($0.bottom - bottom) <= tol && abs($0.top - top) <= tol
     }
     let estimated = samples.filter { $0.estimated }.count * 2 > samples.count
-    return AutoOpening(a: a, b: b, bottom: bottom, top: top, estimated: estimated, stable: agree.count >= 4)
+    return AutoOpening(a: a, b: b, bottom: bottom, top: top, estimated: estimated, stable: agree.count >= need)
+  }
+
+  /// Centres of the doors / windows of `type` counted so far (others are
+  /// put far away so their indices still match `openings`).
+  private func openingCentres(_ type: Int) -> [V3] {
+    openings.map { o in
+      o.type != type
+        ? V3(Float.greatestFiniteMagnitude, 0, Float.greatestFiniteMagnitude)
+        : RoomOpeningCounter.centre(o.a, o.b, bottom: (o.a.y + o.b.y) / 2,
+                                    top: o.topY ?? ((o.a.y + o.b.y) / 2 + 1))
+    }
+  }
+
+  /// Room scan (Auto mode): a door / window attempt is back. Once the
+  /// detections of one kind hold steady, have a door's or window's
+  /// proportions and are not one already counted, it is added: the room's
+  /// doors and windows are counted as it is walked round, with no tap.
+  private func noteRoomOpening(_ c: OpeningCandidate?, kind: OpeningKind, wall: WallFrame) {
+    guard let c else { return }
+    let type = kind == .door ? Self.typeDoor : Self.typeWindow
+    let now = Date()
+    var samples = roomSamples[type] ?? []
+    samples.removeAll { now.timeIntervalSince($0.time) > 2 }
+    let sample = AutoSample(a: c.a, b: c.b, bottom: c.bottom, top: c.top, origin: wall.origin,
+                            normal: wall.normal, estimated: c.estimated, time: now)
+    samples.removeAll { simd_length($0.centre - sample.centre) > Self.sameOpening }
+    samples.append(sample)
+    if samples.count > 6 { samples.removeFirst(samples.count - 6) }
+    roomSamples[type] = samples
+    guard let found = Self.consensus(samples, tol: 0.04, need: 3), found.stable else { return }
+    roomSamples[type] = []
+    let width = found.a.dist2d(found.b)
+    // Counted without a tap, so only on firm ground: the floor known (a
+    // window's sill and a door's foot are checked against it) and a size a
+    // real one has. Small "windows" counted on a guessed floor were posters.
+    guard let fy = snapshot?.floorY, width >= 0.5, found.top - found.bottom >= 0.5 else { return }
+    if !RoomOpeningCounter.plausible(kind, width: width, height: found.top - found.bottom,
+                                     bottom: found.bottom, floorY: fy) { return }
+    let centre = RoomOpeningCounter.centre(found.a, found.b, bottom: found.bottom, top: found.top)
+    // Already counted (as either kind: a glazed door must not count twice).
+    if RoomOpeningCounter.duplicateOf(centre, openingCentres(Self.typeDoor)) != nil
+      || RoomOpeningCounter.duplicateOf(centre, openingCentres(Self.typeWindow)) != nil { return }
+    // A door stands on the floor when it is known.
+    let base = kind == .door ? fy : found.bottom
+    let o = OpeningMark(type: type, a: found.a.withY(base), b: found.b.withY(base), topY: found.top,
+                        method: OpeningMethod.auto.code, estimated: found.estimated)
+    openings.append(o)
+    history.append(Self.hOpening)
+    let name = kind == .door ? "Door" : "Window"
+    diag("room scan: \(name.lowercased()) counted automatically \(openingText(o, fy)), \(elementsSummary() ?? "")")
+    flash("\(name) found: \(openingText(o, fy))  ·  \(elementsSummary() ?? "")")
+    lightHaptics.impactOccurred()
+    overlay.setNeedsDisplay()
   }
 
   /// The ✓ button in Door / Window mode: adds the door or window found: the
   /// stable result (or one that was stable a moment ago), else the
   /// detection so far, flagged as approximate. With nothing detected it
-  /// says what to do instead. Adding one finishes the scan straight away
-  /// (as Finish does): the app then shows its 2D front view.
+  /// says what to do instead. The scan goes on, so every door and window of
+  /// the room can be added (and counted); one already counted at the same
+  /// spot is replaced rather than counted twice. Finish ends the scan.
   private func acceptAutoOpening(_ snap: Snapshot) {
     let now = Date()
     var settled = true
@@ -1708,22 +1843,29 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     let o = OpeningMark(type: isDoor ? Self.typeDoor : Self.typeWindow,
                         a: found.a.withY(base), b: found.b.withY(base), topY: found.top,
                         method: OpeningMethod.auto.code, estimated: found.estimated || !settled)
-    openings.append(o)
-    // One entry: Undo removes the whole opening.
-    history.append(Self.hOpening)
     let centre = ((o.a + o.b) / 2).withY((base + found.top) / 2)
+    // The same door / window counted already (e.g. found during the room
+    // scan): this one, as accepted or adjusted, replaces it.
+    let dup = RoomOpeningCounter.duplicateOf(
+      RoomOpeningCounter.centre(found.a, found.b, bottom: found.bottom, top: found.top),
+      openingCentres(o.type))
+    if let dup {
+      openings[dup] = o
+    } else {
+      openings.append(o)
+      // One entry: Undo removes the whole opening.
+      history.append(Self.hOpening)
+    }
     if let shot = lastOpeningShot { writeOpeningDiag(shot, accepted: true) }
     resetAutoSearch()
     autoSuppress = (centre, Date().addingTimeInterval(2))
     diag("\(mode.label.lowercased()) \(openings.count) (auto, wall \(lastOpeningShot?.source ?? "-")"
       + "\(o.estimated ? ", estimated" : "")\(byHand ? ", adjusted by hand" : "")): \(openingSize(o, fy))")
     notifyHaptics.notificationOccurred(.success)
-    focusOpening = openings.count - 1
-    diag("\(mode.label.lowercased()) added with ✓: finishing the scan")
-    onDone()
-    // onDone always finishes with an opening measured; should it not, the
-    // opening stays and scanning goes on.
-    if !completed { focusOpening = nil }
+    // The scan goes on: point at the next door / window, or tap Finish.
+    flash("\(mode.label) \(dup != nil ? "updated" : "added"): \(openingText(o, fy))  ·  \(elementsSummary() ?? "")"
+      + (settled ? "" : ". The frame had not settled: check its size on the plan."))
+    overlay.setNeedsDisplay()
   }
 
   /// Writes the rectified image of an attempt (opening_<ms>.png, 8-bit
@@ -1863,7 +2005,10 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   /// Floor height from points: the lowest well-filled 5 cm layer between
   /// 0.6 m and 2.2 m below the phone.
   private func estimateFloor(_ pts: [V3], camY: Float) -> Float? {
-    let lo = camY - 2.2
+    // No lower than 1.85 m under the phone: nobody holds it higher. Depth
+    // noise under desks made a "floor" 2.2 m down, so every line drawn and
+    // the room height were wrong.
+    let lo = camY - 1.85
     var bins = [Int](repeating: 0, count: 32)
     var n = 0
     for p in pts {
@@ -1884,6 +2029,9 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     if best < 40 { return nil }
     let threshold = max(40, Int(Float(best) * 0.4))
     guard let i = smooth.indices.first(where: { smooth[$0] >= threshold }) else { return nil }
+    // At the bottom of the range: the points go on below it, so this is the
+    // edge of depth noise, not a floor (a floor has little under it).
+    if i <= 1 { return nil }
     var sum: Float = 0
     var cnt = 0
     for j in max(0, i - 1)...min(31, i + 1) {
@@ -2008,21 +2156,14 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
 
   // ------------------------------------------------------------ measuring logic
 
-  private func autoHeight(_ snap: Snapshot?) -> Float? {
-    guard let f = snap?.floorY, let c = snap?.ceilingY else { return nil }
-    let h = c - f
-    return h >= 1.8 && h <= 5 ? h : nil
-  }
-
-  private func roomHeight() -> Float? {
-    heightMarks.last ?? autoHeight(snapshot) ?? snapshot?.autoRoom?.height
-  }
-
   /// The automatic outline is used unless Corners mode was chosen.
   private func useAutoRoom() -> Bool { !manualOutline }
 
   private func resolveAim(_ snap: Snapshot) -> Aim? {
-    guard let hit = snap.hit else { return nil }
+    // Held still, the median of the last few frames' hits: one frame's
+    // depth / tracking noise no longer goes into the measurement.
+    guard let latest = snap.hit else { return nil }
+    let hit = aimSmoother.point(latest)
     if mode == .corner {
       if corners.count >= 3 && hit.dist2d(corners[0]) < 0.25 {
         return Aim(p: corners[0], snappedCorner: true, closesRoom: true)
@@ -2122,22 +2263,24 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       // depth sensor, distance comes from sideways movement only.
       if sectorsCovered >= Self.spotSectors && moveExtent < Self.spotMove
           && (snap.autoRoom?.estimatedCount ?? 1) > 0 {
-        return "Don't turn on the spot. Walk slowly along the walls with the phone facing them: the camera measures distance from sideways movement."
+        return "Walls aren't measured by turning on the spot: walk slowly along them with the phone facing them. "
+          + "Or tap Corners to mark each corner from where you stand."
       }
       guard let room = snap.autoRoom else {
         return snap.wallCount == 0
-          ? "Walk slowly around the room, about 1–2 m from the walls, with the phone facing the wall. Keep the floor's edge in view. White dots show what is being measured."
+          ? "Walk slowly around the room, about 1–2 m from the walls, with the phone facing the wall. Keep the floor's edge in view. Doors and windows in view are counted automatically."
           : "Keep walking along the walls. The outline appears once enough of them are measured."
       }
       let n = room.estimatedCount
       if n > 0 {
         return "Room found. \(n) dashed side\(n == 1 ? " is" : "s are") estimated. Point the camera at \(n == 1 ? "that wall" : "those walls") to measure \(n == 1 ? "it" : "them"), or tap Finish."
       }
-      return "All walls found. Tap Finish to create the floor plan, or keep scanning to refine it."
+      let counted = elementsSummary().map { " (\($0))" } ?? ""
+      return "All walls found\(counted). Tap Finish, or point at any door or window not counted yet."
     case .corner:
       switch corners.count {
       case 0: return "Aim the crosshair where two walls meet the floor, then tap the button to mark the first corner."
-      case 1, 2: return "Walk to the next corner, going around the room in order, and mark it."
+      case 1, 2: return "Aim at the next corner, going round the room in order, and mark it. You can stay where you are."
       default: return "Mark the next corner. To close the room, aim at the first corner or tap Finish."
       }
     case .door, .window:
@@ -2159,8 +2302,6 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       return pending.isEmpty
         ? "Tap the first point on the screen, or aim the crosshair at it and press the button."
         : "Tap the second point. The distance updates as you move."
-    case .height:
-      return "Aim at the ceiling close to a wall and tap the button to measure the room height."
     }
   }
 
@@ -2168,8 +2309,8 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   private func autoInstruction() -> String {
     let isDoor = mode == .door
     if adjusted != nil {
-      return "Drag the circles or lines onto the \(isDoor ? "door" : "window")'s frame, then tap ✓. "
-        + "Undo goes back to automatic."
+      return "Drag a side's circle (or its line) onto the \(isDoor ? "door" : "window")'s frame: "
+        + "only that side moves. Then tap ✓. Undo goes back to automatic."
     }
     if autoWallMissing {
       return "Point at the wall around the \(isDoor ? "door" : "window") so it can be found."
@@ -2267,19 +2408,6 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       }
     case .line:
       if !placeLinePoint(aim.p, estimated: aim.estimated, via: "aim") { return }
-    case .height:
-      guard let floor = snap.floorY else {
-        flash("Detect the floor first.")
-        return
-      }
-      let h = aim.p.y - floor
-      if h < 1.5 || h > 6 {
-        flash("That point is \(m(h)) above the floor. Aim at the ceiling.")
-        return
-      }
-      heightMarks.append(h)
-      history.append(Self.hHeight)
-      flash("Room height: \(m(h))")
     }
     haptics.impactOccurred()
     overlay.setNeedsDisplay()
@@ -2344,53 +2472,51 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   private var touchEnabled: Bool { tapEnabled || (openingAuto && !completing && !completed) }
 
   fileprivate func tapAllowed(at p: CGPoint) -> Bool {
-    if !touchEnabled { return false }
     for v in [topStack, bottomPanel, completionCard] {
       if let v, !v.isHidden, v.convert(v.bounds, to: tapView).contains(p) { return false }
     }
+    // Room scan: a tap on the 2D plan or on the small map switches them.
+    if planToggleHit(p) { return true }
+    if !touchEnabled { return false }
     // Door / Window: only on the frame's circles and lines; elsewhere the
     // touch goes on to the controls below as before.
     if !tapEnabled { return openingHit(at: p) != nil }
     return true
   }
 
-  /// The circle (0-3) or, away from them, the line (4-7) of the door /
-  /// window frame shown under a finger at `p`.
+  /// The side (OpeningFrameAdjust: 0 bottom, 1 right, 2 top, 3 left) of the
+  /// door / window frame shown under a finger at `p`: by its handle (the
+  /// circle in the middle of each side) or anywhere along its line.
   private func openingHit(at p: CGPoint) -> Int? {
     guard openingAuto, let vp = snapshot?.viewProj, let o = shownOpening else { return nil }
     let size = tapView.bounds.size
     let corners = [o.a, o.b, o.b.withY(o.top), o.a.withY(o.top)]
-    let s = corners.map { project(vp, $0, size) }
-    var best: Int?
-    var bestD: CGFloat = 32
-    for (i, q) in s.enumerated() {
-      guard let q else { continue }
-      let d = hypot(q.x - p.x, q.y - p.y)
-      if d < bestD {
-        bestD = d
-        best = i
-      }
+    let s: [SIMD2<Float>?] = corners.map { c in
+      project(vp, c, size).map { SIMD2<Float>(Float($0.x), Float($0.y)) }
     }
-    if best != nil { return best }
-    bestD = 24
-    for i in 0..<4 {
-      guard let a = s[i], let b = s[(i + 1) % 4] else { continue }
-      let dx = b.x - a.x, dy = b.y - a.y
-      let len2 = dx * dx + dy * dy
-      let t = len2 > 0 ? min(max(((p.x - a.x) * dx + (p.y - a.y) * dy) / len2, 0), 1) : 0
-      let d = hypot(a.x + dx * t - p.x, a.y + dy * t - p.y)
-      if d < bestD {
-        bestD = d
-        best = 4 + i
-      }
-    }
-    return best
+    return OpeningFrameAdjust.pickSide(s, SIMD2<Float>(Float(p.x), Float(p.y)),
+                                       handleRadius: 36, lineRadius: 24)
   }
 
-  /// A finger down on the frame found grabs that circle or line; the frame
-  /// then stays as the user leaves it.
+  /// Where a finger at `p` meets the wall of `adj`: (u along the wall,
+  /// height), or nil when the line of sight runs along the wall or the hit
+  /// is behind / too far.
+  private func wallHit(_ adj: AdjustedOpening, _ p: CGPoint) -> (u: Float, v: Float)? {
+    guard let frame = sceneView.session.currentFrame, let (o, d) = screenRay(p, frame) else { return nil }
+    // The wall: vertical, through the bottom corners, normal across `along`.
+    let n = V3(-adj.along.z, 0, adj.along.x)
+    let den = d.x * n.x + d.z * n.z
+    if abs(den) < 0.05 { return nil }
+    let t = ((adj.origin.x - o.x) * n.x + (adj.origin.z - o.z) * n.z) / den
+    if t <= 0.1 || t > 15 { return nil }
+    let q = o + d * t
+    return ((q.x - adj.origin.x) * adj.along.x + (q.z - adj.origin.z) * adj.along.z, q.y)
+  }
+
+  /// A finger down on the frame found grabs that side; the frame then
+  /// stays as the user leaves it.
   private func grabOpening(at p: CGPoint) {
-    guard let hit = openingHit(at: p), let o = shownOpening else { return }
+    guard let side = openingHit(at: p), let o = shownOpening else { return }
     if adjusted == nil {
       let d = o.b - o.a
       let len = (d.x * d.x + d.z * d.z).squareRoot()
@@ -2399,39 +2525,32 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
                                  left: 0, right: len, bottom: o.bottom, top: o.top, estimated: o.estimated)
       diag("auto \(mode.label.lowercased()): adjusting by hand")
     }
-    adjustGrab = hit
+    guard let adj = adjusted else { return }
+    // Keep where the side is relative to the finger: it follows the
+    // finger's movement from here instead of jumping onto it.
+    if let hit = wallHit(adj, p) {
+      let value = OpeningFrameAdjust.sideValue(side, left: adj.left, right: adj.right,
+                                               bottom: adj.bottom, top: adj.top)
+      adjustOffset = value - (OpeningFrameAdjust.isVertical(side) ? hit.u : hit.v)
+    } else {
+      adjustOffset = 0
+    }
+    adjustGrab = side
     lightHaptics.impactOccurred()
   }
 
-  /// The grabbed circle or line follows the finger, on the frame's wall.
+  /// The held side follows the finger, on the frame's wall. Only that side
+  /// moves: the opposite and adjacent sides stay where they are.
   private func dragOpening(to p: CGPoint) {
-    guard var adj = adjusted, adjustGrab >= 0, let frame = sceneView.session.currentFrame,
-          let (o, d) = screenRay(p, frame) else { return }
-    // The wall: vertical, through the bottom corners, normal across `along`.
-    let n = V3(-adj.along.z, 0, adj.along.x)
-    let den = d.x * n.x + d.z * n.z
-    if abs(den) < 0.05 { return }
-    let t = ((adj.origin.x - o.x) * n.x + (adj.origin.z - o.z) * n.z) / den
-    if t <= 0.1 || t > 15 { return }
-    let q = o + d * t
-    let u = (q.x - adj.origin.x) * adj.along.x + (q.z - adj.origin.z) * adj.along.z
-    let v = q.y
-    let gap: Float = 0.10 // smallest width / height
-    func setLeft() { adj.left = min(u, adj.right - gap) }
-    func setRight() { adj.right = max(u, adj.left + gap) }
-    func setBottom() { adj.bottom = min(v, adj.top - gap) }
-    func setTop() { adj.top = max(v, adj.bottom + gap) }
-    switch adjustGrab {
-    case 0: setLeft(); setBottom()
-    case 1: setRight(); setBottom()
-    case 2: setRight(); setTop()
-    case 3: setLeft(); setTop()
-    case 4: setBottom()
-    case 5: setRight()
-    case 6: setTop()
-    case 7: setLeft()
-    default: return
-    }
+    guard var adj = adjusted, adjustGrab >= 0, let hit = wallHit(adj, p) else { return }
+    let side = adjustGrab
+    let value = (OpeningFrameAdjust.isVertical(side) ? hit.u : hit.v) + adjustOffset
+    let e = OpeningFrameAdjust.moveSide(side, to: value, left: adj.left, right: adj.right,
+                                        bottom: adj.bottom, top: adj.top)
+    adj.left = e.left
+    adj.right = e.right
+    adj.bottom = e.bottom
+    adj.top = e.top
     adjusted = adj
   }
 
@@ -2441,7 +2560,22 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   }
 
   /// A finger went down on the camera view (`began`) or moved on it.
+  /// Room scan: `p` (tap view) is on the 2D plan or the small map.
+  private func planToggleHit(_ p: CGPoint) -> Bool {
+    guard mode == .auto || mode == .corner, !lineOnly else { return false }
+    let q = tapView.convert(p, to: overlay)
+    return planRect.contains(q) || miniRect.contains(q)
+  }
+
   fileprivate func tapMoved(to p: CGPoint, began: Bool) {
+    if planToggleHit(p) {
+      if began {
+        planBig.toggle()
+        lightHaptics.impactOccurred()
+        overlay.setNeedsDisplay()
+      }
+      return
+    }
     if !tapEnabled {
       // Door / Window: dragging the frame found.
       if began { grabOpening(at: p) } else { dragOpening(to: p) }
@@ -2522,7 +2656,6 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       pending = [l.a]
       lineStartEstimated = l.aEstimated
       history.append(Self.hEdge)
-    case Self.hHeight: heightMarks.removeLast()
     default: return
     }
     flash("Undone")
@@ -2595,7 +2728,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   @objc private func onReset() {
     if completing { cancelAutoComplete("start over tapped") }
     let hasData = !corners.isEmpty || !openings.isEmpty || !surfaces.isEmpty || !lines.isEmpty
-      || !pending.isEmpty || !heightMarks.isEmpty || (autoRoom != nil && !lineOnly) || !photos.isEmpty
+      || !pending.isEmpty || (autoRoom != nil && !lineOnly) || !photos.isEmpty
     if !hasData {
       resetScan()
       return
@@ -2604,7 +2737,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       title: "Start over?",
       message: lineOnly
         ? "This clears everything measured and starts again."
-        : "This clears the room outline and every door, window, surface, line and height measured, and scans the room again.",
+        : "This clears the room outline and every door, window, surface and line measured, and scans the room again.",
       preferredStyle: .alert)
     alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
     alert.addAction(UIAlertAction(title: "Start over", style: .destructive) { _ in self.resetScan() })
@@ -2662,7 +2795,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     flash("Photo saved with measurements (\(photos.count))")
   }
 
-  /// "W × D m  ·  Area A m²  ·  Height H m" for the outline in use.
+  /// "W × D m  ·  Area A m²" for the outline in use.
   private func photoCaption() -> String {
     let sep = "  ·  "
     var parts = [String]()
@@ -2674,7 +2807,6 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       parts.append(String(format: "Area %.2f m²", area()))
       parts.append("Perimeter \(m(perimeter()))")
     }
-    if let h = roomHeight() { parts.append("Height \(m(h))") }
     return parts.joined(separator: sep)
   }
 
@@ -2719,6 +2851,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     writeDiag(force: true)
     beginDiagScan()
     scanGeneration += 1
+    furniture.clear()
     planeFloorY = nil
     pointFloorY = nil
     ceilingY = nil
@@ -2752,7 +2885,6 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     lineStartEstimated = false
     tapPreview = nil
     failedTap = nil
-    heightMarks.removeAll()
     history.removeAll()
     resetAutoSearch()
     autoSuppress = nil
@@ -2777,8 +2909,38 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     overlay.setNeedsDisplay()
   }
 
-  @objc private func onDone() {
+  @objc private func onDone() { finish(confirmed: false) }
+
+  private func finish(confirmed: Bool) {
     let auto = snapshot?.autoRoom
+    // An automatic outline that is mostly guesswork (half its sides or more
+    // estimated) is not saved without asking: plain walls the camera can't
+    // measure gave rooms like 4.6 × 0.9 m. Marking the corners works there.
+    let mostlyGuessed = auto.map { $0.estimatedCount * 2 >= $0.corners.count } ?? false
+    let noWalls = (snapshot?.wallCount ?? 0) == 0
+    if !confirmed, !lineOnly, useAutoRoom(), let auto, mostlyGuessed || noWalls {
+      if presentedViewController != nil { return }
+      if completing { cancelAutoComplete("outline unreliable") }
+      let measured = max(auto.corners.count - auto.estimatedCount, 0)
+      diag("finish: outline unreliable (estimated \(auto.estimatedCount) of \(auto.corners.count), walls \(snapshot?.wallCount ?? 0)), asking")
+      let why = mostlyGuessed
+        ? "Only \(measured) of \(auto.corners.count) walls were measured; the rest of this outline is a guess"
+        : "No wall was measured directly; this outline only comes from the edges of the floor and ceiling"
+      let alert = UIAlertController(
+        title: "Room not measured yet",
+        message: why + ", so its size is probably wrong.\n\nPlain walls are hard for the camera. Mark the corners "
+          + "instead: stand in the room, aim at each corner where the walls meet the floor and tap +.",
+        preferredStyle: .alert)
+      alert.addAction(UIAlertAction(title: "Mark corners", style: .default) { _ in
+        let b = UIButton()
+        b.tag = Mode.corner.rawValue
+        self.onTab(b)
+      })
+      alert.addAction(UIAlertAction(title: "Save anyway", style: .default) { _ in self.finish(confirmed: true) })
+      alert.addAction(UIAlertAction(title: "Keep scanning", style: .cancel))
+      present(alert, animated: true)
+      return
+    }
     let outline: [V3]
     // The result holds distances only, no room: asked for at the start, or
     // lines were measured in a normal scan before any room outline existed.
@@ -2821,8 +2983,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       + ", openings \(openings.count) (\(openings.filter { $0.topY != nil }.count) with height, "
       + "\(openings.filter { $0.method == OpeningMethod.auto.code }.count) auto, "
       + "\(openings.filter { $0.method == OpeningMethod.touch.code }.count) touch)"
-      + ", surfaces \(surfaces.count), lines \(lines.count), floorY \(fmt(floorY))"
-      + ", height \(fmt(roomHeight()))")
+      + ", surfaces \(surfaces.count), lines \(lines.count), floorY \(fmt(floorY))")
     var out: [String: Any] = [
       "xs": outline.map { Double($0.x) },
       "zs": outline.map { Double($0.z) },
@@ -2854,10 +3015,15 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       "lineOnly": linesOnly,
       // Annotated room photos (absolute JPEG paths); may be empty.
       "photos": photos,
+      // Furniture found by the AI detector: 6 values each (centre x, z,
+      // width, depth, height, direction of its width), kinds alongside.
+      "elements": linesOnly ? [] : furniture.confirmed.flatMap { f -> [Double] in
+        [Double(f.center.x), Double(f.center.z), Double(f.width), Double(f.depth), Double(f.height), Double(f.yaw)]
+      },
+      "elementKinds": linesOnly ? [] : furniture.confirmed.map { $0.kind },
       // Name of this scan's diagnostics file in Documents/room_measure/diag.
       "diagFile": diagFileName,
     ]
-    if let h = roomHeight() { out["height"] = Double(h) }
     if let floorY { out["floorY"] = Double(floorY) }
     // The door / window just added with ✓, which finished the scan: the app
     // shows its 2D front view first.
@@ -2889,12 +3055,14 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       status = "Scanning  ·  \(measured) of \(room.corners.count) walls  ·  \(coveragePercent)% around"
     } else if mode == .auto && room == nil {
       status = "Scanning  ·  \(coveragePercent)% around"
+    } else if mode == .auto && room != nil && !usedCorners && !lookedRound {
+      status = "All walls found  ·  turn round for doors & windows  ·  \(coveragePercent)%"
     } else if mode == .auto && room != nil && snap?.floorY != nil {
       status = usedCorners
         ? "All walls found  ·  tap Finish"
         : "All walls found  ·  hold steady…"
     } else if snap?.floorY == nil && snap?.autoRoom != nil {
-      status = "Room found  ·  tilt down to the floor for height"
+      status = "Room found  ·  tilt down to the floor"
     } else if snap?.floorY == nil {
       status = "Scanning  ·  include some floor"
     } else {
@@ -3013,13 +3181,19 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
           let since = stableSince else { return nil }
     let steady = Date().timeIntervalSince(since)
     let estimated = room.estimatedCount
-    if estimated == 0 {
+    // Doors and windows are only counted on walls the camera has looked at:
+    // finishing as soon as the walls were found (often from a few corners)
+    // ended the scan before most of them had been in view.
+    if estimated == 0 && lookedRound {
       let floorKnown = !autoRoomGuessedFloor && (planeFloorY ?? pointFloorY) != nil
       if steady >= (floorKnown ? Self.stableFor : Self.stableForNoFloor) {
         return floorKnown ? "a" : "b"
       }
     }
+    // Some walls measured as walls, not only outlined from the floor and
+    // ceiling edges: turning on the spot gave a different size every time.
     if sectorsCovered >= Self.walkedSectors && moveExtent >= Self.walkedMove
+        && (snapshot?.wallCount ?? 0) >= 2
         && steady >= Self.stableForWalked
         && estimated <= (room.corners.count == 4 ? 1 : 2) {
       return "c"
@@ -3031,11 +3205,16 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     if let kind = autoCompleteKind() { startAutoComplete(kind) }
   }
 
+  /// The camera has looked nearly all the way round the room (every wall in
+  /// view at some point), so its doors and windows had their chance.
+  private var lookedRound: Bool { sectorsCovered >= Self.lookRoundSectors }
+
   /// Shows the completion card briefly as feedback, then finishes exactly
   /// as the Finish button does (unless a mode switch, Undo, Start over,
   /// Close or lost tracking cancels it first). No confirmation is asked.
   private func startAutoComplete(_ kind: String) {
-    guard let room = autoRoom else { return }
+    // Never on an outline that is mostly guesswork: Finish asks about that.
+    guard let room = autoRoom, room.estimatedCount * 2 < room.corners.count else { return }
     completing = true
     completionKind = kind
     diag(String(format: "auto-complete (%@): %d corners %.2f x %.2f m, area %.2f m², estimated sides %d, "
@@ -3104,8 +3283,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     title.textColor = .white
     title.textAlignment = .center
 
-    var sizeText = String(format: "%.2f × %.2f m · Area %.2f m²", room.width, room.depth, room.area)
-    if let h = roomHeight() { sizeText += String(format: " · Height %.2f m", h) }
+    let sizeText = String(format: "%.2f × %.2f m · Area %.2f m²", room.width, room.depth, room.area)
     let size = UILabel()
     size.text = sizeText
     size.font = PlanoraFont.inter(15, .semibold, tabular: true)
@@ -3120,7 +3298,8 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     if est > 0 {
       caveats.append("\(est) wall\(est == 1 ? "" : "s") estimated — check \(est == 1 ? "it" : "them") on the plan")
     }
-    if roomHeight() == nil { caveats.append("Height not measured") }
+    // What was counted along the way (doors and windows).
+    if let counts = elementsSummary() { caveats.append(counts) }
     let note = UILabel()
     note.text = caveats.joined(separator: "\n")
     note.font = PlanoraFont.inter(13, .medium)
@@ -3183,22 +3362,25 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   }
 
   /// The measurements line under the camera view, for the selected mode:
-  /// the room in Auto and Corners, the marked openings in Door and Window,
-  /// the room height in Height.
+  /// the room in Auto and Corners (with the doors and windows counted so
+  /// far), the marked openings in Door and Window.
   private func statsText(_ auto: AutoRoom?) -> String {
     let sep = "   ·   "
     switch mode {
     case .auto:
-      guard let auto else { return "Measuring the room..." }
+      let counts = elementsSummary()
+      guard let auto else { return "Measuring the room..." + (counts.map { sep + $0 } ?? "") }
       var parts = ["\(m(auto.width)) × \(m(auto.depth))",
                    String(format: "Area %.2f m²", auto.area),
-                   "Perimeter \(m(auto.perimeter))"]
-      if let h = roomHeight() { parts.append("Height \(m(h))") }
+                   "Perimeter \(m(auto.perimeter))",
+                   "\(auto.corners.count) walls"]
+      if let counts { parts.append(counts) }
       return parts.joined(separator: sep)
     case .corner:
       var parts = ["\(corners.count) corner\(corners.count == 1 ? "" : "s")"]
       if corners.count >= 2 { parts.append("Perimeter \(m(perimeter()))") }
       if corners.count >= 3 { parts.append(String(format: "Area %.2f m²", area())) }
+      if let counts = elementsSummary() { parts.append(counts) }
       return parts.joined(separator: sep)
     case .door, .window:
       let type = mode == .door ? Self.typeDoor : Self.typeWindow
@@ -3221,8 +3403,64 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       if lines.isEmpty { return "No lines measured yet" }
       return "\(lines.count) line\(lines.count == 1 ? "" : "s"):  "
         + lines.map { ($0.estimated ? "≈ " : "") + m($0.length) }.joined(separator: ",  ")
-    case .height:
-      return roomHeight().map { "Room height \(m($0))" } ?? "Room height not measured yet"
+    }
+  }
+
+  /// "2 doors · 3 windows" for what this scan has found so far (marked,
+  /// accepted or counted automatically); nil when there are none.
+  private func elementsSummary() -> String? {
+    let doors = openings.filter { $0.type == Self.typeDoor }.count
+    let windows = openings.filter { $0.type == Self.typeWindow }.count
+    let things = mode == .auto ? furniture.confirmed.count : 0
+    if doors == 0 && windows == 0 && things == 0 { return nil }
+    return "\(doors) door\(doors == 1 ? "" : "s") · \(windows) window\(windows == 1 ? "" : "s")"
+      + (things > 0 ? " · \(things) object\(things == 1 ? "" : "s")" : "")
+  }
+
+  /// AI furniture detection (main thread), a little over once a second: the
+  /// camera image goes to the detector on its own queue; what it finds is
+  /// placed on the floor and added to `furniture`.
+  private func maybeDetectFurniture(_ frame: ARFrame, floorY: Float, orientation: UIInterfaceOrientation) {
+    let now = CACurrentMediaTime()
+    if furnitureBusy || furnitureModelFailed || now - lastFurnitureAttempt < 0.7 { return }
+    lastFurnitureAttempt = now
+    let camera = frame.camera
+    let k = camera.intrinsics
+    let cam = PinholeCamera(sensorToWorld: camera.transform,
+                            fx: k.columns.0.x, fy: k.columns.1.y, cx: k.columns.2.x, cy: k.columns.2.y)
+    // The captured image is landscape (home button right): turned upright
+    // as the phone is held.
+    let degrees: Int
+    switch orientation {
+    case .portraitUpsideDown: degrees = 270
+    case .landscapeLeft: degrees = 180
+    case .landscapeRight: degrees = 0
+    default: degrees = 90
+    }
+    // Only the image is kept, not the frame (ARKit stops when too many are held).
+    let buffer = frame.capturedImage
+    let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer)
+    let gen = scanGeneration
+    furnitureBusy = true
+    furnitureQueue.async { [weak self] in
+      guard let self else { return }
+      if self.furnitureModel == nil { self.furnitureModel = FurnitureModel() }
+      guard let model = self.furnitureModel else {
+        DispatchQueue.main.async {
+          self.furnitureModelFailed = true
+          self.furnitureBusy = false
+        }
+        return
+      }
+      let toSensor = uprightToSensor(degrees, w, h)
+      let uprightH = Float(degrees % 180 == 0 ? h : w)
+      let found = model.detect(buffer, degrees: degrees).compactMap {
+        FurniturePlacement.place($0, cam: cam, floorY: floorY, uprightHeight: uprightH, toSensor: toSensor)
+      }
+      DispatchQueue.main.async {
+        self.furnitureBusy = false
+        if gen == self.scanGeneration { found.forEach(self.furniture.add) }
+      }
     }
   }
 
@@ -3357,7 +3595,9 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     tabs.translatesAutoresizingMaskIntoConstraints = false
     let tabFont = PlanoraFont.inter(13, .semibold)
     // Surface measuring is hidden from the camera.
-    for md in Mode.allCases where md != .surface {
+    // Measuring distances only: no room outline is returned, so the room
+    // modes (whose result would be thrown away) are not offered.
+    for md in Mode.allCases where md != .surface && !(lineOnly && (md == .auto || md == .corner)) {
       let b = UIButton(type: .custom)
       b.setTitle(md.label, for: .normal)
       b.titleLabel?.font = tabFont
@@ -3685,18 +3925,29 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     let cx = size.width / 2
     let cy = size.height / 2
     let vp = snap.viewProj
+    if !forPhoto {
+      planRect = .null
+      miniRect = .null
+    }
+    // Room scan with the 2D plan: the camera image stays clear; what was
+    // found is drawn on the plan.
+    let plan2d = !forPhoto && livePlanShown
 
     if forPhoto {
       if !lineOnly, useAutoRoom(), let room = snap.autoRoom ?? autoRoom {
         drawAutoRoom(ctx, snap, room, size)
       }
-    } else if snap.tracking {
+    } else if snap.tracking && !(plan2d && mode == .auto) {
+      // Corner mode keeps these with its plan: they are aimed at.
       drawSurfaces(ctx, snap, size)
       drawFramePoints(ctx, snap, size)
       if mode == .corner { drawCornerCandidates(ctx, snap, size) }
-      // The automatic outline and its side lengths only in Auto mode, so the
-      // measurements on screen are always those of the current mode.
-      if mode == .auto, let room = snap.autoRoom { drawAutoRoom(ctx, snap, room, size) }
+    }
+    // Auto room scan: the walls, corners, doors, windows and furniture
+    // outlined in white on the camera image as they are found (lengths are
+    // on the plan).
+    if !forPhoto && snap.tracking && mode == .auto && !lineOnly {
+      drawLiveWalls(ctx, snap, size)
     }
     // Touching a point with the phone: nothing is aimed at.
     let touch = touching
@@ -3751,8 +4002,9 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     func openingColor(_ type: Int) -> UIColor { type == Self.typeDoor ? Self.door : Self.window }
     func openingChip(_ type: Int) -> UIColor { type == Self.typeDoor ? Self.doorChip : Self.windowChip }
 
-    // Doors and windows.
-    for o in openings {
+    // Doors and windows (on the 2D plan instead while it is shown).
+    // Auto scan: drawn as white frames by drawLiveWalls.
+    for o in openings where !(mode == .auto && !forPhoto && !lineOnly) {
       let color = openingColor(o.type)
       let a = openingPoint(o.type, o.a)
       let b = openingPoint(o.type, o.b)
@@ -3868,7 +4120,8 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     }
     // Auto: the door or window found, amber dashed until the detections
     // agree, then green.
-    // Adjusted by hand: solid orange, the part being dragged in blue.
+    // Adjusted by hand: solid orange, the side being dragged in blue. Each
+    // side has its own handle (the circle at its middle) and moves alone.
     if autoOpenings, snap.tracking, let found = shownOpening {
       let hand = adjusted != nil
       let color = hand ? Self.door : (found.stable ? Self.snap : Self.door)
@@ -3878,14 +4131,21 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       let corners = [p, q, qt, pt]
       let g = adjustGrab
       for i in 0..<4 {
-        let held = hand && g >= 0 && (g == 4 + i || g == i || g == (i + 1) % 4)
-        line(corners[i], corners[(i + 1) % 4], held ? Self.accent : color, width: 2.5, dash: dash)
+        // Side i runs from corner i to i + 1.
+        line(corners[i], corners[(i + 1) % 4], hand && g == i ? Self.accent : color, width: 2.5, dash: dash)
       }
-      for (i, c) in corners.enumerated() {
+      // Corners: small dots only (dragging a corner moved two sides).
+      for c in corners {
         guard let s = project(vp, c, size) else { continue }
-        let r: CGFloat = hand ? 9 : 6
+        fillCircle(ctx, s, 3.5, color)
+      }
+      // One handle per side, at its middle: it moves that side only.
+      for i in 0..<4 {
+        guard let s = project(vp, (corners[i] + corners[(i + 1) % 4]) / 2, size) else { continue }
+        let held = hand && g == i
+        let r: CGFloat = held ? 12 : 10
         fillCircle(ctx, s, r, .white)
-        fillCircle(ctx, s, r - 2, hand && g == i ? Self.accent : color)
+        fillCircle(ctx, s, r - 2.5, held ? Self.accent : color)
       }
       var text = String(format: "%.2f × %.2f m", p.dist2d(q), found.top - found.bottom)
       if mode == .window, let fy { text += " · sill \(m(found.bottom - fy))" }
@@ -3912,12 +4172,8 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       fillCircle(ctx, s, 6, .white)
       fillCircle(ctx, s, 4, pendingColor)
     }
-    if mode == .height, let aim, let fy {
-      chip(cx, cy - 34, "\(m(aim.p.y - fy)) above floor")
-    }
-
     if mode == .auto {
-      drawMiniMap(ctx, nil, size)
+      if plan2d { drawLivePlan(ctx, snap, size) } else { drawMiniMap(ctx, nil, size) }
       return
     }
 
@@ -3967,7 +4223,11 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
       }
     }
     // The map is of the room, which a plain distance measurement has none of.
-    if !lineOnly { drawMiniMap(ctx, aim, size) }
+    if plan2d && mode == .corner {
+      drawLivePlan(ctx, snap, size, aim: aim)
+    } else if !lineOnly {
+      drawMiniMap(ctx, aim, size)
+    }
 
     // The finger on the screen, drawn last so nothing covers it.
     if let tp = tapPreview {
@@ -4058,6 +4318,76 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     }
   }
 
+  /// Auto room scan, drawn like a room scanner's live view: every wall found
+  /// so far outlined in white on the camera image (where it meets the floor,
+  /// where it meets the ceiling, and up each end, so the corners are white
+  /// lines floor to ceiling), doors and windows as white frames, and
+  /// furniture as white boxes. It grows wall by wall as the user turns round
+  /// the room; once the room's outline is found, that is drawn instead
+  /// (sides not measured dashed).
+  private func drawLiveWalls(_ ctx: CGContext, _ snap: Snapshot, _ size: CGSize) {
+    let vp = snap.viewProj
+    let wallPlanes = snap.planes.filter { $0.kind == .wall }
+    let wallPoints = wallPlanes.flatMap { $0.points }
+    guard let fy = snap.floorY ?? snap.autoRoom?.corners.first?.y ?? wallPoints.map({ $0.y }).min() else { return }
+    let segs: [(V3, V3)]
+    let est: [Bool]
+    if let room = snap.autoRoom, room.corners.count >= 3 {
+      let n = room.corners.count
+      segs = (0..<n).map { (room.corners[$0].withY(fy), room.corners[($0 + 1) % n].withY(fy)) }
+      est = (0..<n).map { $0 < room.estimated.count && room.estimated[$0] }
+    } else {
+      let joined = LivePlan.connectWalls(LivePlan.mergeWalls(wallPlanes.compactMap { LivePlan.wallLine($0.points) }))
+      segs = joined.walls.map { ($0.0.withY(fy), $0.1.withY(fy)) }
+      est = segs.map { _ in false }
+    }
+    // The top: the ceiling when found, otherwise as high as the walls have
+    // been seen (once that is clearly more than a skirting).
+    let seenTop = wallPoints.map { $0.y }.max()
+    let top: Float? = snap.ceilingY.flatMap { $0 - fy > 1.5 ? $0 : nil }
+      ?? seenTop.flatMap { $0 - fy > 1.2 ? $0 : nil }
+    let shadow = UIColor(white: 0, alpha: 0.31)
+    func edge(_ a: V3, _ b: V3, dashed: Bool = false) {
+      guard let (p, q) = projectSegment(vp, a, b, size) else { return }
+      strokeLine(ctx, p, q, shadow, width: 7)
+      strokeLine(ctx, p, q, .white, width: 4, dash: dashed ? [10, 8] : nil)
+    }
+    for (i, s) in segs.enumerated() {
+      let (a, b) = s
+      edge(a, b, dashed: est[i])
+      if let top {
+        edge(a.withY(top), b.withY(top), dashed: est[i])
+        edge(a, a.withY(top))
+        edge(b, b.withY(top))
+      } else {
+        // Not seen high enough yet: short posts at the ends.
+        edge(a, a.withY(fy + 0.5))
+        edge(b, b.withY(fy + 0.5))
+      }
+    }
+    // Doors and windows: a white frame in their wall.
+    for o in openings {
+      guard let t = o.topY else { continue }
+      let a = o.type == Self.typeDoor ? o.a.withY(fy) : o.a
+      let b = o.type == Self.typeDoor ? o.b.withY(fy) : o.b
+      edge(a, b)
+      edge(a, a.withY(t))
+      edge(b, b.withY(t))
+      edge(a.withY(t), b.withY(t))
+    }
+    // Furniture found by the AI detector: a white box.
+    let thin = UIColor(white: 1, alpha: 0.86)
+    for f in furniture.confirmed {
+      let base = f.footprint.map { $0.withY(fy) }
+      let up = base.map { $0.withY(fy + f.height) }
+      for k in 0..<4 {
+        for (p, q) in [(base[k], base[(k + 1) % 4]), (up[k], up[(k + 1) % 4]), (base[k], up[k])] {
+          if let (sp, sq) = projectSegment(vp, p, q, size) { strokeLine(ctx, sp, sq, thin, width: 2) }
+        }
+      }
+    }
+  }
+
   private func drawCornerCandidates(_ ctx: CGContext, _ snap: Snapshot, _ size: CGSize) {
     for c in snap.cornerCandidates {
       let base = snap.floorY.map { c.withY($0) } ?? c
@@ -4085,6 +4415,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     // right holds the controls, so it goes under the card on the left.
     let left = size.width > size.height ? hintFrame.minX : size.width - box - 16
     let top = hintFrame.maxY + 12
+    if (mode == .auto || mode == .corner) && !lineOnly { miniRect = CGRect(x: left, y: top, width: box, height: box) }
     let mapCard = UIBezierPath(roundedRect: CGRect(x: left, y: top, width: box, height: box), cornerRadius: 16)
     Self.ink.withAlphaComponent(0.8).setFill()
     mapCard.fill()
@@ -4175,6 +4506,325 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     }
   }
 
+  /// Room scan: the live 2D floor plan, in the lower part of the screen
+  /// (landscape: the right half), heading-up so the wall in front of the
+  /// phone is at its top. It shows the wall surfaces as they are picked up,
+  /// the room outline once there is one (measured walls solid with their
+  /// lengths, estimated ones amber and dashed), doors with their swing and
+  /// windows as found, the phone with its field of view and the directions
+  /// looked at so far, and the room's size and counts. Twin of drawLivePlan
+  /// in ArMeasureActivity.kt.
+  private func drawLivePlan(_ ctx: CGContext, _ snap: Snapshot, _ size: CGSize, aim: Aim? = nil) {
+    let landscape = size.width > size.height
+    let safe = view.safeAreaInsets
+    // Corner mode keeps the crosshair (screen centre) and its hints clear:
+    // the plan starts further down (landscape: further right).
+    let marking = mode == .corner
+    var bottom = size.height - 10
+    if let p = bottomPanel, !p.isHidden { bottom = p.convert(p.bounds, to: overlay).minY - 10 }
+    let left: CGFloat, right: CGFloat, top: CGFloat
+    if landscape {
+      left = size.width * (marking ? 0.62 : 0.5)
+      right = size.width - 12 - safe.right
+      top = 12 + safe.top
+    } else {
+      left = 12 + safe.left
+      right = size.width - 12 - safe.right
+      var cardBottom: CGFloat = safe.top
+      if let t = topStack, !t.isHidden { cardBottom = t.convert(t.bounds, to: overlay).maxY }
+      top = max(cardBottom + 12, marking ? size.height / 2 + 72 : size.height * 0.40)
+    }
+    if bottom - top < 140 || right - left < 140 {
+      drawMiniMap(ctx, aim, size)
+      return
+    }
+    let panel = CGRect(x: left, y: top, width: right - left, height: bottom - top)
+    planRect = panel
+    let card = UIBezierPath(roundedRect: panel, cornerRadius: 20)
+    Self.ink.withAlphaComponent(0.94).setFill()
+    card.fill()
+    Self.hairline.setStroke()
+    card.lineWidth = 1
+    card.stroke()
+    ctx.saveGState()
+    ctx.addPath(card.cgPath)
+    ctx.clip()
+
+    let header: CGFloat = 52
+    // Corner mode: the walls marked so far, each drawn with its length as it
+    // is marked, and a live line to the crosshair.
+    let room = marking ? nil : snap.autoRoom
+    let corners = marking ? self.corners.map { $0.withY(0) } : (room?.corners ?? [])
+    let seen: [(V3, V3)] = snap.tracking
+      ? LivePlan.mergeWalls(snap.planes.filter { $0.kind == .wall }.compactMap { LivePlan.wallLine($0.points) })
+      : []
+    let floors = snap.planes.filter { $0.kind == .floor }
+    let aimP = marking ? aim?.p.withY(0) : nil
+    var pts = corners
+    for (a, b) in seen { pts += [a, b] }
+    for o in openings { pts += [o.a, o.b] }
+    if let aimP { pts.append(aimP) }
+    let body = CGRect(x: left, y: top + header, width: right - left, height: bottom - top - header)
+    let t = LivePlan.fit(pts, cam: snap.camPos, forward: snap.camForward, in: body, pad: 26)
+    func sp(_ p: V3) -> CGPoint { t.point(p) }
+
+    // 1 m grid, turning with the plan.
+    let reach = Int(max(panel.width, panel.height) / t.scale) + 2
+    let gx0 = Int(t.cx.rounded(.down)), gz0 = Int(t.cz.rounded(.down))
+    ctx.setStrokeColor(UIColor(white: 1, alpha: 0.09).cgColor)
+    ctx.setLineWidth(1)
+    for k in -reach...reach {
+      let gx = Float(gx0 + k), gz = Float(gz0 + k)
+      let lo0 = Float(gz0 - reach), hi0 = Float(gz0 + reach)
+      let lo1 = Float(gx0 - reach), hi1 = Float(gx0 + reach)
+      ctx.move(to: t.point(gx, lo0)); ctx.addLine(to: t.point(gx, hi0))
+      ctx.move(to: t.point(lo1, gz)); ctx.addLine(to: t.point(hi1, gz))
+    }
+    ctx.strokePath()
+
+    // Floor scanned so far.
+    ctx.setFillColor(Self.snap.withAlphaComponent(0.18).cgColor)
+    for f in floors where f.points.count >= 3 {
+      ctx.addLines(between: f.points.map(sp))
+      ctx.closePath()
+      ctx.fillPath()
+    }
+
+    // Room outline.
+    let n = corners.count
+    // The user stands in the room, so before there is an outline the phone
+    // is on the inside.
+    let inside = n >= 3
+      ? V3(corners.reduce(0) { $0 + $1.x } / Float(n), 0, corners.reduce(0) { $0 + $1.z } / Float(n))
+      : snap.camPos
+
+    func wallStroke(_ a: CGPoint, _ b: CGPoint) {
+      ctx.saveGState()
+      ctx.setStrokeColor(UIColor.white.cgColor)
+      ctx.setLineWidth(6)
+      ctx.setLineCap(.square)
+      ctx.move(to: a)
+      ctx.addLine(to: b)
+      ctx.strokePath()
+      ctx.restoreGState()
+    }
+
+    // Walls found so far. Before the outline (Auto) they are drawn as walls,
+    // each with its length, the moment they are found; once there is an
+    // outline (or while marking) they stay faint.
+    let seenAsWalls = !marking && n < 3
+    if seenAsWalls {
+      for (a, b) in seen { wallStroke(sp(a), sp(b)) }
+    } else {
+      let seenColor = UIColor(red: 150 / 255, green: 175 / 255, blue: 1, alpha: 0.27)
+      for (a, b) in seen { strokeLine(ctx, sp(a), sp(b), seenColor, width: 4) }
+    }
+
+    if marking {
+      // Marked walls, the room not closed yet: solid, and dashed back to the
+      // first corner once it could be closed.
+      if n >= 2 { for i in 1..<n { wallStroke(sp(corners[i - 1]), sp(corners[i])) } }
+      if n >= 3 { strokeLine(ctx, sp(corners[n - 1]), sp(corners[0]), UIColor(white: 1, alpha: 0.67), width: 2, dash: [5, 5]) }
+    } else if n >= 3, let room {
+      ctx.addLines(between: corners.map(sp))
+      ctx.closePath()
+      ctx.setFillColor(UIColor(white: 1, alpha: 0.1).cgColor)
+      ctx.fillPath()
+      for i in 0..<n {
+        let a = sp(corners[i]), b = sp(corners[(i + 1) % n])
+        if i < room.estimated.count && room.estimated[i] {
+          strokeLine(ctx, a, b, Self.door, width: 3, dash: [7, 5])
+        } else {
+          ctx.saveGState()
+          ctx.setStrokeColor(UIColor.white.cgColor)
+          ctx.setLineWidth(6)
+          ctx.setLineCap(.square)
+          ctx.move(to: a)
+          ctx.addLine(to: b)
+          ctx.strokePath()
+          ctx.restoreGState()
+        }
+      }
+    }
+
+    // Furniture found by the AI detector: its footprint and name.
+    if !marking {
+      let nameAttrs: [NSAttributedString.Key: Any] = [
+        .font: UIFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: UIColor(white: 1, alpha: 0.7),
+      ]
+      for f in furniture.confirmed {
+        ctx.saveGState()
+        ctx.addLines(between: f.footprint.map(sp))
+        ctx.closePath()
+        ctx.setFillColor(UIColor(white: 1, alpha: 0.16).cgColor)
+        ctx.setStrokeColor(UIColor(white: 1, alpha: 0.6).cgColor)
+        ctx.setLineWidth(1.5)
+        ctx.drawPath(using: .fillStroke)
+        ctx.restoreGState()
+        let s = f.kind as NSString
+        let sz = s.size(withAttributes: nameAttrs)
+        let c = sp(f.center)
+        s.draw(at: CGPoint(x: c.x - sz.width / 2, y: c.y - sz.height / 2), withAttributes: nameAttrs)
+      }
+    }
+
+    // Doors and windows: the wall cut open, then their symbol.
+    for o in openings {
+      let a = sp(o.a), b = sp(o.b)
+      ctx.saveGState()
+      ctx.setStrokeColor(Self.ink.cgColor)
+      ctx.setLineWidth(8)
+      ctx.setLineCap(.butt)
+      ctx.move(to: a)
+      ctx.addLine(to: b)
+      ctx.strokePath()
+      ctx.restoreGState()
+      if o.type == Self.typeDoor {
+        let swing = LivePlan.doorSwing(o.a, o.b, inside: inside)
+        strokeLine(ctx, a, sp(swing.leaf), Self.door, width: 2)
+        ctx.saveGState()
+        ctx.setStrokeColor(Self.door.cgColor)
+        ctx.setLineWidth(2)
+        ctx.setLineDash(phase: 0, lengths: [3, 3])
+        ctx.addLines(between: swing.arc.map(sp))
+        ctx.strokePath()
+        ctx.restoreGState()
+      } else {
+        let l = hypot(b.x - a.x, b.y - a.y)
+        if l < 1 { continue }
+        let nx = -(b.y - a.y) / l * 3.5, ny = (b.x - a.x) / l * 3.5
+        ctx.saveGState()
+        ctx.setStrokeColor(Self.window.cgColor)
+        ctx.setLineWidth(2)
+        ctx.addLines(between: [CGPoint(x: a.x + nx, y: a.y + ny), CGPoint(x: b.x + nx, y: b.y + ny),
+                               CGPoint(x: b.x - nx, y: b.y - ny), CGPoint(x: a.x - nx, y: a.y - ny)])
+        ctx.closePath()
+        ctx.move(to: a)
+        ctx.addLine(to: b)
+        ctx.strokePath()
+        ctx.restoreGState()
+      }
+    }
+
+    // A wall's length in a pill beside its middle, on the side away from the
+    // room.
+    let ic = sp(inside)
+    let lenAttrs: [NSAttributedString.Key: Any] = [
+      .font: PlanoraFont.inter(11, .semibold, tabular: true), .foregroundColor: UIColor.white,
+    ]
+    let labelInk = Self.rgb(30, 41, 59, 230)
+    func lengthLabel(_ wa: V3, _ wb: V3, _ str: String, _ bg: UIColor) {
+      let a = sp(wa), b = sp(wb)
+      let mid = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
+      let l = hypot(b.x - a.x, b.y - a.y)
+      if l < 18 { return }
+      var nx = -(b.y - a.y) / l, ny = (b.x - a.x) / l
+      if (ic.x - mid.x) * nx + (ic.y - mid.y) * ny > 0 { nx = -nx; ny = -ny }
+      let text = str as NSString
+      let sz = text.size(withAttributes: lenAttrs)
+      let c = CGPoint(x: mid.x + nx * 16, y: mid.y + ny * 16)
+      let pill = UIBezierPath(roundedRect: CGRect(x: c.x - sz.width / 2 - 7, y: c.y - 10,
+                                                  width: sz.width + 14, height: 20), cornerRadius: 10)
+      bg.setFill()
+      pill.fill()
+      text.draw(at: CGPoint(x: c.x - sz.width / 2, y: c.y - sz.height / 2), withAttributes: lenAttrs)
+    }
+
+    // Wall lengths, outside the room.
+    if marking {
+      if n >= 2 { for i in 1..<n { lengthLabel(corners[i - 1], corners[i], m(corners[i - 1].dist2d(corners[i])), labelInk) } }
+    } else if n >= 3, let room {
+      for i in 0..<n {
+        let est = i < room.estimated.count && room.estimated[i]
+        lengthLabel(corners[i], corners[(i + 1) % n], m(room.side(i)) + (est ? " ?" : ""),
+                    est ? Self.estChip : labelInk)
+      }
+    } else if seenAsWalls {
+      for (a, b) in seen { lengthLabel(a, b, m(a.dist2d(b)), labelInk) }
+    }
+
+    // Corner mode: the wall being measured, from the last corner to the
+    // crosshair, with its length as it changes; marked corners.
+    if marking {
+      if let aimP, let last = corners.last {
+        strokeLine(ctx, sp(last), sp(aimP), Self.snap, width: 3, dash: [7, 5])
+        lengthLabel(last, aimP, m(last.dist2d(aimP)), Self.snapChip)
+      }
+      for c in corners { fillCircle(ctx, sp(c), 4.5, Self.accent) }
+      if let aimP {
+        let c = sp(aimP)
+        let hot = aim?.snappedCorner == true || aim?.closesRoom == true
+        ctx.saveGState()
+        ctx.setStrokeColor((hot ? Self.snap : UIColor.white).cgColor)
+        ctx.setLineWidth(2)
+        ctx.strokeEllipse(in: CGRect(x: c.x - 6, y: c.y - 6, width: 12, height: 12))
+        ctx.restoreGState()
+      }
+    }
+
+    // The phone: its field of view (forward is always up), the directions
+    // looked at so far round it, and a dot.
+    if snap.tracking {
+      let c = sp(snap.camPos)
+      let reachFov: CGFloat = 70, half = reachFov * 0.58 // tan 30°
+      ctx.saveGState()
+      ctx.addLines(between: [c, CGPoint(x: c.x - half, y: c.y - reachFov), CGPoint(x: c.x + half, y: c.y - reachFov)])
+      ctx.closePath()
+      ctx.clip()
+      let colors = [Self.accent.withAlphaComponent(0.45).cgColor, Self.accent.withAlphaComponent(0).cgColor] as CFArray
+      if let g = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0, 1]) {
+        ctx.drawLinearGradient(g, start: c, end: CGPoint(x: c.x, y: c.y - reachFov), options: [])
+      }
+      ctx.restoreGState()
+      // Sector i covers world directions from -180° + 30° i (atan2(z, x)).
+      let ns = Self.sectorCount
+      let step = 2 * CGFloat.pi / CGFloat(ns)
+      ctx.saveGState()
+      ctx.setLineWidth(3)
+      ctx.setLineCap(.round)
+      for i in 0..<ns {
+        let a = Float(-Double.pi + (Double(i) + 0.5) * Double(step))
+        let w = t.point(snap.camPos.x + cos(a), snap.camPos.z + sin(a))
+        let ang = atan2(w.y - c.y, w.x - c.x)
+        ctx.addArc(center: c, radius: 22, startAngle: ang - step / 2 + 0.05, endAngle: ang + step / 2 - 0.05,
+                   clockwise: false)
+        ctx.setStrokeColor((sectors[i] ? Self.snap : UIColor(white: 1, alpha: 0.24)).cgColor)
+        ctx.strokePath()
+      }
+      ctx.restoreGState()
+      fillCircle(ctx, c, 8, .white)
+      fillCircle(ctx, c, 5.5, Self.accent)
+    }
+    ctx.restoreGState()
+
+    // Header: size and area, then what was counted.
+    let title: String
+    if marking {
+      switch n {
+      case 0: title = "Aim at a corner on the floor and mark it"
+      case 1: title = "Now aim at the next corner"
+      default:
+        var total: Float = 0
+        for i in 1..<n { total += corners[i - 1].dist2d(corners[i]) }
+        title = "\(n - 1) wall\(n == 2 ? "" : "s")  ·  \(m(total))"
+          + (n >= 3 ? "  ·  " + String(format: "%.2f m²", LivePlan.area(corners)) : "")
+      }
+    } else if let room, n >= 3 {
+      title = "\(m(room.width)) × \(m(room.depth))  ·  " + String(format: "%.2f m²", LivePlan.area(corners))
+    } else if !seen.isEmpty {
+      title = "\(seen.count) wall\(seen.count == 1 ? "" : "s") found"
+    } else {
+      title = "Point at the walls to start the plan"
+    }
+    (title as NSString).draw(at: CGPoint(x: left + 16, y: top + 10), withAttributes: [
+      .font: PlanoraFont.inter(15, .semibold, tabular: true), .foregroundColor: UIColor.white,
+    ])
+    let sub = (elementsSummary() ?? "No doors or windows yet") + "  ·  tap for camera"
+    (sub as NSString).draw(at: CGPoint(x: left + 16, y: top + 30), withAttributes: [
+      .font: UIFont.systemFont(ofSize: 12), .foregroundColor: UIColor(white: 1, alpha: 0.67),
+    ])
+  }
+
   // ------------------------------------------------------------ constants
 
   private static let maxCloud = 40000
@@ -4188,6 +4838,8 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   private static let minExtendSlope: Float = 0.14
   private static let maxExtendDistance: Float = 6
   private static let sectorCount = 12
+  /// Sectors (of `sectorCount`) seen before a room scan finishes by itself.
+  private static let lookRoundSectors = sectorCount - 2
   private static let maxPathSamples = 2000
   /// Turning on the spot: this many sectors looked at while the phone has
   /// moved less than this far (metres).
@@ -4222,7 +4874,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
   private static let hCorner = 0
   private static let hEdge = 1
   private static let hOpening = 2
-  private static let hHeight = 3
+  // 3 was the removed room-height mark.
   /// Second base point of a door / window, or corner B of a surface.
   private static let hBase = 4
   /// A door / window completed with its top (replaces hEdge + hBase).
@@ -4237,7 +4889,7 @@ final class ArMeasureViewController: UIViewController, ARSessionDelegate {
     UIColor(red: r / 255, green: g / 255, blue: b / 255, alpha: a / 255)
   }
 
-  // Planora palette.
+  // ECM-AI palette.
   /// Ink #0B1426 and its lighter step #16213A.
   private static let ink = rgb(11, 20, 38)
   private static let ink2 = rgb(22, 33, 58)

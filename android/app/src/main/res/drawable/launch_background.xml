@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Launch screen: the Planora logo on the brand's navy. -->
+<!-- Launch screen: the ECM-AI logo on the brand's navy. -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item>
         <color android:color="#0B1426" />

@@ -32,6 +32,23 @@ class PlanEditor {
             scan.lines[k].copyWith(footprint: plan.lines[k].footprint);
       }
     }
+    // Where photos were taken, and furniture, move into the same coordinates.
+    if (plan != null) {
+      for (var k = 0; k < scan.photoPins.length; k++) {
+        final p = scan.photoPins[k];
+        scan.photoPins[k] = p.copyWith(
+          position: plan.toPlan(p.position),
+          direction: p.direction == null ? null : plan.dirToPlan(p.direction!),
+        );
+      }
+      for (var k = 0; k < scan.elements.length; k++) {
+        final e = scan.elements[k];
+        final pos = e.position;
+        if (pos == null) continue;
+        scan.elements[k] = e.copyWith(
+            position: plan.toPlan(pos), angle: e.angle == null ? null : e.angle! - plan.rotation);
+      }
+    }
     final n = corners.length;
     scan.walls
       ..clear()

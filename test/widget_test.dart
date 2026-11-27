@@ -13,7 +13,8 @@ void main() {
     await tester.pumpWidget(const RoomMeasureApp());
     // Saved rooms load from disk (real I/O), so don't wait for it to settle.
     await tester.pump(const Duration(milliseconds: 300));
-    expect(find.text('Planora'), findsOneWidget);
+    // The ECM-AI logo image in the app bar.
+    expect(find.bySemanticsLabel('ECM-AI'), findsOneWidget);
     // Measure and History pages.
     expect(find.text('Measure'), findsOneWidget);
     expect(find.text('History'), findsOneWidget);
@@ -32,7 +33,17 @@ void main() {
     ));
     await tester.pumpAndSettle();
     expect(find.text('Floor area'), findsOneWidget);
-    expect(find.text('Ceiling height'), findsOneWidget);
+    // Room height is no longer measured or shown anywhere.
+    expect(find.textContaining('Ceiling'), findsNothing);
+    expect(find.text('Volume'), findsNothing);
+    // Doors and windows are counted.
+    expect(find.text('Doors'), findsOneWidget);
+    expect(find.text('Windows'), findsOneWidget);
+    await tester.scrollUntilVisible(find.text('1 × Window'), 200,
+        scrollable: find.byType(Scrollable).last);
+    expect(find.text('Found in this room'), findsOneWidget);
+    expect(find.text('1 × Door'), findsOneWidget);
+    expect(find.text('1 × Window'), findsOneWidget);
     expect(find.text('Walls (4)'), findsOneWidget);
     expect(find.text('Save room'), findsOneWidget);
     expect(tester.takeException(), isNull);

@@ -98,12 +98,9 @@ class ElevationPainter extends CustomPainter {
       ..color = ink
       ..strokeWidth = 1.5
       ..style = PaintingStyle.stroke;
-    // Without a room the wall is only a backdrop: no corners or ceiling.
+    // Without a room the wall is only a backdrop: no corners. No ceiling
+    // height is measured, so no ceiling line either.
     if (!e.standalone) {
-      canvas.drawLine(wall.topLeft, wall.topRight,
-          Paint()
-            ..color = e.wallHeightAssumed ? quiet : ink
-            ..strokeWidth = 1);
       canvas.drawLine(wall.topLeft, wall.bottomLeft, edge);
       canvas.drawLine(wall.topRight, wall.bottomRight, edge);
     }
@@ -189,12 +186,6 @@ class ElevationPainter extends CustomPainter {
       _vDim(canvas, 0, e.head, math.min(xHead, wall.right + 50),
           'Top ${_len(e.head, approx: est || e.sillAssumed || e.heightAssumed)}',
           color: quiet);
-    }
-    // Wall height, left of the wall.
-    if (!e.standalone) {
-      _vDim(canvas, 0, e.wallHeight, wall.left - 30,
-          _len(e.wallHeight, approx: e.wallHeightAssumed),
-          color: quiet, assumed: e.wallHeightAssumed);
     }
   }
 

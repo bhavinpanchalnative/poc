@@ -15,12 +15,36 @@ class FloorPlan {
   FloorPlan({
     required this.corners,
     required this.openings,
-    required this.height,
     required this.warnings,
     required this.snappedWalls,
     this.surfaces = const [],
     this.lines = const [],
+    this.ceilingHeight,
+    this.rotation = 0,
+    this.scale = 1,
+    this.origin = Vec2.zero,
   });
+
+  /// The room's measured floor-to-ceiling height, when known (LiDAR).
+  final double? ceilingHeight;
+
+  /// How scan coordinates became plan coordinates: turned by -[rotation]
+  /// (radians), scaled by [scale], then moved so [origin] is at (0, 0).
+  /// See [toPlan].
+  final double rotation;
+  final double scale;
+  final Vec2 origin;
+
+  /// A point given in the scan's coordinates (as its walls, e.g. where a
+  /// photo was taken) in plan coordinates.
+  Vec2 toPlan(Vec2 p) => p.rotate(-rotation) * scale - origin;
+
+  /// A direction given in the scan's coordinates in plan coordinates.
+  Vec2 dirToPlan(Vec2 d) => d.rotate(-rotation);
+
+  /// The inverse of [toPlan]: a point on the plan in the scan's coordinates
+  /// (e.g. where the user tapped to place a 360° photo).
+  Vec2 fromPlan(Vec2 p) => ((p + origin) * (1 / scale)).rotate(rotation);
 
   /// Corner i is where wall i starts; wall i runs to corner i+1.
   final List<Vec2> corners;
@@ -31,7 +55,6 @@ class FloorPlan {
 
   /// The scan's point-to-point distances, with ends in plan coordinates.
   final List<MeasuredLine> lines;
-  final double? height;
   final List<String> warnings;
 
   /// How many walls were snapped to a right angle.
@@ -60,23 +83,6 @@ class FloorPlan {
     return maxX >= maxY
         ? (width: maxX, depth: maxY)
         : (width: maxY, depth: maxX);
-  }
-
-  /// Floor area times ceiling height, when the height is known.
-  double? get volume => height == null ? null : area * height!;
-
-  /// Total wall surface without subtracting doors and windows.
-  double? get grossWallArea => height == null ? null : perimeter * height!;
-
-  /// Surface of all doors and windows (typical heights where not measured).
-  double get openingsArea => openings
-      .where((o) => o.wallIndex < wallCount)
-      .fold(0.0, (s, o) => s + o.width * (o.height ?? o.type.typicalHeight));
-
-  /// Paintable wall surface: gross wall area minus doors and windows.
-  double? get netWallArea {
-    final g = grossWallArea;
-    return g == null ? null : math.max(0.0, g - openingsArea);
   }
 
   /// Start and end of opening [o] in plan coordinates, clamped to its wall.
@@ -196,7 +202,7 @@ class FloorPlanBuilder {
         // Walls that already share their corner (e.g. a split wall) are
         // exact; only warn when the corner had to be guessed.
         if (prevEnd.distanceTo(curStart) > 0.02) {
-          warnings.add('Walls $i and ${i + 1} are almost parallel, so their '
+          warnings.add('Walls ${(i - 1 + n) % n + 1} and ${i + 1} are almost parallel, so their '
               'corner is estimated. Add the short wall between them.');
         }
       }
@@ -217,9 +223,12 @@ class FloorPlanBuilder {
     final plan = FloorPlan(
       corners: shifted,
       openings: List.of(scan.openings),
-      height: scan.height,
       warnings: warnings,
       snappedWalls: snapped,
+      ceilingHeight: scan.ceilingHeight,
+      rotation: rot,
+      scale: scan.scale,
+      origin: shift,
       surfaces: [
         for (final s in scan.surfaces)
           s.copyWith(footprint: [for (final p in s.footprint) toPlan(p)]),

@@ -14,9 +14,8 @@ void main() {
       const Vec2(-0.01, 2.99),
     ].map((p) => p.rotate(0.4)).toList();
 
-    final scan = scanFromCorners(corners, name: 'Test', height: 2.6);
+    final scan = scanFromCorners(corners, name: 'Test');
     expect(scan.walls, hasLength(4));
-    expect(scan.height, 2.6);
 
     final plan = FloorPlanBuilder(squareCorners: true).build(scan);
     final lengths = plan.wallLengths;

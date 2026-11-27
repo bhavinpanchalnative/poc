@@ -64,11 +64,18 @@ class _ScanGuideScreenState extends State<ScanGuideScreen> {
                 'you cover the room.'
           ),
           (
+            Icons.sensor_door_outlined,
+            'Doors and windows',
+            'They are found and counted as you go: pause for a moment with '
+                'each one in view. One that was missed can be added in the '
+                'Door or Window tab, and its frame adjusted side by side.'
+          ),
+          (
             Icons.check_circle_outline_rounded,
             'It finishes by itself',
             'When every wall is measured a ✓ appears and your floor plan '
-                'opens. Tap the ✓ to keep scanning, for example to mark '
-                'doors and windows first.'
+                'opens with the doors and windows counted. Tap the ✓ to keep '
+                'scanning.'
           ),
         ];
 
@@ -80,7 +87,7 @@ class _ScanGuideScreenState extends State<ScanGuideScreen> {
     return Scaffold(
       appBar: AppBar(
         centerTitle: true,
-        title: const PlanoraLogo(size: 28),
+        title: const BrandLogo(size: 28),
       ),
       body: SafeArea(
         child: Column(children: [

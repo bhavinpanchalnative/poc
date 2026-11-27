@@ -39,6 +39,22 @@ void main() {
     expect(w.update(rect(4.5, 3.6), t0.add(const Duration(seconds: 9))), isFalse);
   });
 
+  test('a LiDAR scan waits until the user has looked all the way round', () {
+    final w = LidarCompletion(hold: const Duration(seconds: 3));
+    final t0 = DateTime(2026, 1, 1, 12);
+    Duration s(int n) => Duration(seconds: n);
+    // Closed and steady, but only half the room looked at: doors and windows
+    // on the other walls would be missed.
+    expect(w.update(rect(4.2, 3.6), t0, sectorsSeen: 6), isFalse);
+    expect(w.update(rect(4.2, 3.6), t0.add(s(4)), sectorsSeen: 6), isFalse);
+    expect(w.update(rect(4.2, 3.6), t0.add(s(8)), sectorsSeen: 9), isFalse);
+    // Turned round to every wall: finishes (it has held steady long since).
+    expect(
+        w.update(rect(4.2, 3.6), t0.add(s(9)),
+            sectorsSeen: LidarCompletion.lookRoundSectors),
+        isTrue);
+  });
+
   test('walls arriving in any order are recognised as a closed room', () {
     final shuffled = rect(4.2, 3.6);
     final mixed = [shuffled[2], shuffled[0].reversed(), shuffled[3], shuffled[1]];

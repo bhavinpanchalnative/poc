@@ -72,6 +72,7 @@ class _PhotoMeasureScreenState extends State<PhotoMeasureScreen> {
       if (x == null) return;
       final bytes = await File(x.path).readAsBytes();
       final img = await decodeImageFromList(bytes);
+      if (!mounted) return;
       setState(() {
         _file = File(x.path);
         _image = img;

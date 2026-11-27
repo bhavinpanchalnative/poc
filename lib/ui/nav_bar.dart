@@ -15,8 +15,8 @@ class DockItem {
 /// The bottom navigation: a floating, frosted capsule with the pages on
 /// either side of a raised scan button in the brand gradient. The selected
 /// page is marked by a tinted pill that slides between items.
-class PlanoraDock extends StatelessWidget {
-  const PlanoraDock({
+class BrandDock extends StatelessWidget {
+  const BrandDock({
     super.key,
     required this.items,
     required this.selected,

@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Planora app icon: blue-to-navy tile with the room / measuring-line mark.
-     The monochrome layer lets Android 13+ draw a themed icon. -->
+<!-- ECM-AI app icon: the ai robot from the logo on white.
+     No monochrome layer: as one colour the robot loses its "ai". -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@mipmap/ic_launcher_background" />
     <foreground android:drawable="@mipmap/ic_launcher_foreground" />
-    <monochrome android:drawable="@mipmap/ic_launcher_foreground" />
 </adaptive-icon>

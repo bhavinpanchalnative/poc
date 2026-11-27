@@ -119,6 +119,18 @@ class _HomeScreenState extends State<HomeScreen> {
   /// New rooms start without a name: the user types it (asked for once it is measured).
   String get _nextName => '';
 
+  /// The room most recently measured in (a saved room, or the room given
+  /// for a door / window): offered for the next door / window.
+  String get _lastRoomName {
+    final candidates = <(DateTime, String)>[
+      for (final s in saved)
+        if (s.name.trim().isNotEmpty) (s.createdAt, s.name),
+      for (final o in looseOpenings)
+        if (o.room.trim().isNotEmpty) (o.measuredAt, o.room),
+    ]..sort((a, b) => b.$1.compareTo(a.$1));
+    return candidates.isEmpty ? '' : candidates.first.$2;
+  }
+
   Future<void> _open(
     RoomScan scan, {
     bool saved = false,
@@ -146,12 +158,15 @@ class _HomeScreenState extends State<HomeScreen> {
   /// The user names what was just measured: the room, and any lines and
   /// surfaces in it, that have no name yet. Mandatory: nothing is saved
   /// before every name is typed.
-  Future<void> _nameScan(RoomScan scan) async {
+  Future<void> _nameScan(RoomScan scan, {String? suggestion}) async {
     final labels = <String>[];
     final apply = <void Function(String)>[];
+    final initial = <String>[];
     if (isUnnamed(scan.name)) {
       labels.add('Room name');
       apply.add((n) => scan.name = n);
+      // What kind of room the scanner recognised (LiDAR), to accept or change.
+      initial.add(suggestion ?? '');
     }
     for (var k = 0; k < scan.lines.length; k++) {
       final l = scan.lines[k];
@@ -167,18 +182,78 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     if (labels.isEmpty || !mounted) return;
     final names = await askNames(context,
-        title: labels.length == 1 ? 'Name this room' : 'Name your measurements', labels: labels);
+        title: labels.length == 1 ? 'Name this room' : 'Name your measurements',
+        labels: labels,
+        initial: initial);
     for (var i = 0; i < names.length; i++) {
       apply[i](names[i]);
     }
+  }
+
+  /// LiDAR, several rooms scanned in one go: the user names the floor and
+  /// each room (offered as recognised: Kitchen, Bedroom...), then the rooms
+  /// are saved and placed on a new floor map as they were scanned, which
+  /// opens.
+  Future<void> _saveFloor(CapturedScan captured) async {
+    final rooms = captured.floorRooms;
+    final suggested = captured.floorSuggestedNames;
+    String size(RoomScan s) {
+      try {
+        final p = const FloorPlanBuilder().build(s);
+        return '${_len(p.overallSize.width)} × ${_len(p.overallSize.depth)}';
+      } on PlanException {
+        return '${s.walls.length} walls';
+      }
+    }
+
+    final labels = [
+      'Floor name',
+      for (var i = 0; i < rooms.length; i++) 'Room ${i + 1} · ${size(rooms[i])}',
+    ];
+    final names = await askNames(context,
+        title: 'Name the ${rooms.length} rooms scanned',
+        labels: labels,
+        initial: ['', ...suggested]);
+    if (!mounted) return;
+    // Not named (dialog closed): the rooms are still kept, with the names
+    // offered, so nothing scanned is lost.
+    final ok = names.length == labels.length;
+    String nameOf(int i) {
+      final n = ok ? names[i + 1].trim() : '';
+      if (n.isNotEmpty) return n;
+      return i < suggested.length ? suggested[i] : 'Room ${i + 1}';
+    }
+
+    final mapName = ok && names[0].trim().isNotEmpty
+        ? names[0].trim()
+        : 'Floor ${DateTime.now().day}/${DateTime.now().month}';
+    final map = FloorMap(
+      id: RoomScan.newId(),
+      name: mapName,
+      createdAt: DateTime.now(),
+    );
+    for (var i = 0; i < rooms.length; i++) {
+      final s = rooms[i];
+      s.name = nameOf(i);
+      await ScanStore.save(s);
+      final off = i < captured.floorOffsets.length ? captured.floorOffsets[i] : null;
+      // A room whose plan can't be built is saved, but not put on the map
+      // (it shows in History to be fixed).
+      if (off != null) map.rooms.add(MapRoom(scanId: s.id, offset: off));
+    }
+    await MapStore.save(map);
+    if (!mounted) return;
+    showMessage(context, '${rooms.length} rooms saved as the floor map "$mapName".');
+    await _openMap(map);
   }
 
   Future<void> _saveAndOpen(
     RoomScan scan, {
     bool justScanned = false,
     int? openOpening,
+    String? suggestedName,
   }) async {
-    await _nameScan(scan);
+    await _nameScan(scan, suggestion: suggestedName);
     if (!mounted) return;
     await ScanStore.save(scan);
     if (!mounted) return;
@@ -245,24 +320,35 @@ class _HomeScreenState extends State<HomeScreen> {
           await (await ScanStore.photoFile(p)).delete();
         } catch (_) {}
       }
-      // The user names each door, window and line measured (mandatory).
+      // The user names each door, window and line measured (mandatory),
+      // and says which room the doors / windows are in, so the room shows
+      // with them everywhere.
       var loose = captured.looseOpenings;
+      final askRoom = loose.isNotEmpty;
       final labels = [
+        if (askRoom) 'Room',
         for (final o in loose)
           '${o.type.label} · ${_len(o.width)}${o.height == null ? '' : ' × ${_len(o.height!)}'}',
         for (final l in lines) 'Line · ${_len(l.length)}',
       ];
+      final first = askRoom ? 1 : 0;
       final names = labels.isEmpty || !mounted
           ? const <String>[]
           : await askNames(context,
-              title: labels.length == 1
+              title: labels.length - first == 1
                   ? 'Name this ${loose.isEmpty ? 'line' : loose.first.type.label.toLowerCase()}'
                   : 'Name your measurements',
-              labels: labels);
+              labels: labels,
+              initial: [if (askRoom) _lastRoomName]);
       if (names.length == labels.length) {
-        loose = [for (var i = 0; i < loose.length; i++) loose[i].copyWith(name: names[i])];
+        final room = askRoom ? names[0] : '';
+        loose = [
+          for (var i = 0; i < loose.length; i++)
+            loose[i].copyWith(name: names[first + i], room: room),
+        ];
       }
-      String lineName(int i) => names.length == labels.length ? names[loose.length + i] : '';
+      String lineName(int i) =>
+          names.length == labels.length ? names[first + loose.length + i] : '';
       if (loose.isNotEmpty) {
         await OpeningStore.save([
           ...loose.reversed,
@@ -307,6 +393,11 @@ class _HomeScreenState extends State<HomeScreen> {
       }
       return;
     }
+    // Several rooms (LiDAR): saved together as a floor map.
+    if (captured.isFloor) {
+      await _saveFloor(captured);
+      return;
+    }
     // Straight to the floor plan: the room is named automatically and can
     // be renamed there.
     final est = captured.estimatedWalls;
@@ -321,6 +412,7 @@ class _HomeScreenState extends State<HomeScreen> {
       captured.scan,
       justScanned: captured.complete,
       openOpening: captured.focusOpening,
+      suggestedName: captured.suggestedName,
     );
   }
 
@@ -438,7 +530,7 @@ class _HomeScreenState extends State<HomeScreen> {
           kind: window ? HistoryKind.window : HistoryKind.door,
           title: o.name,
           subtitle: [
-            'On its own',
+            o.room.trim().isEmpty ? 'No room' : o.room.trim(),
             if (window && o.sill != null) 'sill ${len(o.sill!)}',
           ].join('  ·  '),
           value: [
@@ -590,12 +682,12 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         titleSpacing: 20,
         toolbarHeight: 64,
-        title: history ? const Text('History') : const PlanoraLogo(size: 32),
+        title: history ? const Text('History') : const BrandLogo(size: 32),
         actions: const [UnitButton(), SizedBox(width: 12)],
       ),
       // Content scrolls on under the floating dock.
       extendBody: true,
-      bottomNavigationBar: PlanoraDock(
+      bottomNavigationBar: BrandDock(
         selected: _page,
         onSelected: (i) => setState(() => _page = i),
         items: const [
